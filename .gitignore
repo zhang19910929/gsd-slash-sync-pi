@@ -1,0 +1,5 @@
+# Local pi state created when the test suite spawns a real pi process.
+.pi/
+
+# Local sync artefacts, if anyone runs the plugin against this directory.
+.gsd-slash-sync-state.json

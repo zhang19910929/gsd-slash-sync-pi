@@ -1,0 +1,13 @@
+{
+  "name": "gsd-slash-sync",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Sync GSD Core slash commands into pi as native prompt templates",
+  "scripts": {
+    "install": "node gsd-slash-sync.js install",
+    "sync": "node gsd-slash-sync.js sync",
+    "status": "node gsd-slash-sync.js status",
+    "verify": "node test/verify.mjs",
+    "verify:pi": "node test/verify-pi-e2e.mjs"
+  }
+}
