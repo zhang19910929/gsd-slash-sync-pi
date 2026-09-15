@@ -2,7 +2,8 @@
 
 /**
  * gsd-slash-sync — installs GSD Core's slash commands into pi as native prompt
- * templates, and keeps them in sync across GSD Core updates.
+ * templates and GSD's subagents as pi-subagents agent definitions, and keeps
+ * both in sync across GSD Core updates.
  *
  * ── Why this exists ───────────────────────────────────────────────────────────
  * GSD Core's own capability descriptor for pi
@@ -13,18 +14,24 @@
  *
  * i.e. a pi install is deliberately *plugin-only*: GSD ships
  * `<agentDir>/extensions/gsd.js` (which registers the single `/gsd` hub command
- * plus the `gsd_invoke` tool) and NEVER installs a `commands/gsd/` directory or
- * per-command prompt templates. Claude Code installs get the full
- * `~/.claude/gsd-core/commands/gsd/*.md` set, which is why Claude Code shows all
- * of them under `/gsd-…` while pi shows only `/gsd`.
+ * plus the `gsd_invoke` tool) and NEVER installs a `commands/gsd/` directory,
+ * per-command prompt templates, or an `agents/` directory. Every other runtime's
+ * descriptor carries an `agents` artifact (`destSubpath: "agents"`,
+ * `prefix: "gsd-"`) with a `convertClaudeAgentTo<Runtime>Agent` converter; pi is
+ * the only one with an empty `artifactLayout`. Claude Code installs get the full
+ * `~/.claude/gsd-core/{commands/gsd,agents}/*.md` sets, which is why Claude Code
+ * shows all of them under `/gsd-…` and can dispatch `gsd-planner` while pi shows
+ * only `/gsd` and has no named subagents at all.
  *
- * This extension closes that gap without forking GSD: it reads the canonical
- * command definitions that GSD already ships for *another* runtime, converts
- * them to pi's native prompt-template format, and registers the generated
- * directory with pi through the documented `resources_discover` event.
+ * This extension closes both gaps without forking GSD: it reads the canonical
+ * command/agent definitions that GSD already ships for *another* runtime,
+ * converts them to pi's native formats, registers the generated command
+ * directory with pi through the documented `resources_discover` event, and
+ * writes the agents where pi-subagents discovers them.
  *
  *   source (canonical, shipped by GSD)      →  pi (generated)
  *   ~/.claude/gsd-core/commands/gsd/*.md    →  ~/.pi/agent/gsd-commands/gsd-*.md
+ *   ~/.claude/gsd-core/agents/gsd-*.md      →  ~/.pi/agent/agents/gsd-*.md
  *
  * Re-running is cheap and idempotent: a content fingerprint short-circuits the
  * no-op case, and files are only rewritten when their bytes actually change.
@@ -55,11 +62,28 @@
  *   /gsd-sync --dry-run           show the plan, write nothing
  *   /gsd-sync --mode inline       switch to full-fidelity inlined templates
  *   /gsd-sync --naming colon      generate `/gsd:plan-phase` style names
+ *   /gsd-sync --no-agents         skip the subagent definitions
  *
  *   node gsd-slash-sync.js sync [--dry-run|--status|--json|--force|--mode …]
  *   node gsd-slash-sync.js install          copy self into extensions/
  *
  * Sync also happens automatically on session start when GSD Core has changed.
+ *
+ * ── Subagents ─────────────────────────────────────────────────────────────────
+ * GSD workflows spawn named agents (`Agent(subagent_type="gsd-planner", …)`, 149
+ * spawn sites across the pi GSD tree) and GSD's own dispatch resolver tells pi
+ * to substitute `coder`/`explore`/`plan` — Kimi Code's built-ins, which do not
+ * exist here. Converting the agents to pi-subagents definitions and teaching the
+ * generated commands the exact `subagent({ agent, task })` translation is what
+ * makes those steps run instead of degrading to inline work.
+ *
+ * Generated agent frontmatter only ever names pi *builtin* tools: a declared
+ * extension tool would be dropped from the child allowlist anyway, `mcp:<server>`
+ * selectors that cannot resolve abort the whole spawn, and an allowlist that
+ * filters down to nothing leaves the child with no tools at all. Capabilities
+ * without a pi tool (skills, web/MCP lookups, nested fanout, asking the user) are
+ * instead spelled out in a `<pi_runtime_contract>` block at the top of the agent
+ * prompt, where the child can act on them.
  *
  * @param {object} pi pi ExtensionAPI (registerCommand / registerTool / on / …)
  */
@@ -77,11 +101,20 @@ const GENERATOR = 'gsd-slash-sync';
 // Bump on ANY change to the conversion output (not just when the CLI surface
 // changes): the state file records this string and a mismatch forces a re-sync,
 // so an upgraded plugin never leaves stale templates behind.
-const GENERATOR_VERSION = '1.1.0';
+const GENERATOR_VERSION = '1.2.0';
 const STATE_FILE = '.gsd-slash-sync-state.json';
+// The agent set keeps its own state file: the two artifacts are written into
+// different directories and can be redirected independently, so each one carries
+// the record of what it owns without a schema migration of the other.
+const AGENTS_STATE_FILE = '.gsd-slash-sync-agents-state.json';
 const CONFIG_FILE = 'gsd-slash-sync.json';
 const MARKER_PREFIX = `<!-- generated by ${GENERATOR}`;
+// How far into a file to look for the generator marker when the state file has
+// no record of it. Agent frontmatter (name + a long description + tools) alone
+// can exceed 400 bytes, so the marker that follows it must still be in range.
+const MARKER_SCAN_BYTES = 4096;
 const MIN_SOURCE_COMMANDS = 5; // refuse to wipe an install on a broken source
+const MIN_SOURCE_AGENTS = 5; // same guard for the generated agent set
 const MAX_INLINE_DEPTH = 6;
 
 const HOME = os.homedir();
@@ -93,6 +126,10 @@ const DEFAULT_CONFIG = Object.freeze({
   naming: 'hyphen',
   /** output directory (absolute, or ~/…); default <agentDir>/gsd-commands */
   outDir: null,
+  /** output directory for the pi-subagents agent definitions; default <agentDir>/agents */
+  agentsOut: null,
+  /** convert GSD's subagents into pi-subagents agent definitions */
+  syncAgents: true,
   /** explicit source directory holding the canonical commands/gsd/*.md */
   source: null,
   /** inline mode only: fall back to reference past this many KB (0 = no limit) */
@@ -292,11 +329,33 @@ function resolveOptions(flags = {}, ctx = {}) {
   const notify = pick(flags.notify, env.GSD_SLASH_SYNC_NOTIFY, file.notify, DEFAULT_CONFIG.notify, parseBoolean);
 
   const outDir = path.resolve(expandHome(String(pick(flags.outDir, env.GSD_SLASH_SYNC_OUT, file.outDir, null) || path.join(agentDir, 'gsd-commands'))));
+  const agentsOut = path.resolve(
+    expandHome(
+      String(
+        pick(flags.agentsOut, env.GSD_SLASH_SYNC_AGENTS_OUT, file.agentsOut, null) ||
+          // pi-subagents' user agent directory, and the same global path GSD's own
+          // `getAgentsDir('pi')` resolves to (agent-install-check.cjs).
+          path.join(agentDir, 'agents'),
+      ),
+    ),
+  );
+  // `syncAgents` reads as a positive option (config `syncAgents`, flag `--no-agents`,
+  // env `GSD_SLASH_SYNC_NO_AGENTS=1`), so the negative inputs are inverted here.
+  const noAgentsEnv = parseBoolean(env.GSD_SLASH_SYNC_NO_AGENTS);
+  const syncAgents = pick(
+    flags.noAgents === true ? false : flags.agents === true ? true : undefined,
+    noAgentsEnv === undefined ? undefined : !noAgentsEnv,
+    file.syncAgents,
+    DEFAULT_CONFIG.syncAgents,
+    parseBoolean,
+  );
   const source = pick(flags.source, env.GSD_SLASH_SOURCE, file.source, null);
 
   return {
     agentDir,
     outDir,
+    agentsOut,
+    syncAgents,
     source: source ? path.resolve(expandHome(String(source))) : null,
     mode,
     naming,
@@ -426,20 +485,157 @@ function discoverSource(opts) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Agent source discovery
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Candidate directories holding canonical `agents/gsd-*.md` (Claude dialect).
+ *
+ * The pi tree comes first but is normally absent — pi installs are plugin-only,
+ * so the canonical copy is whatever install GSD wrote for another runtime.
+ * Converted copies for other runtimes (Codex TOML, Cursor's reduced markdown) are
+ * scored out rather than special-cased, so they can be listed safely.
+ *
+ * With an explicit `--source` the search stays inside that tree: an explicit
+ * source is a user instruction about *which* GSD Core copy to convert, and
+ * silently mixing in agents from a different install could pair a command's
+ * workflow with an agent definition from another version.
+ */
+/**
+ * Candidate directories holding canonical `agents/gsd-*.md`.
+ *
+ * The pi tree comes first but is normally absent — pi installs are plugin-only,
+ * so the canonical copy is whatever install GSD wrote for another runtime.
+ * Converted copies for other runtimes (Codex TOML, Cursor's reduced markdown) are
+ * scored out rather than special-cased, so they can be listed safely.
+ *
+ * For Claude Code the *installed* directory (`~/.claude/agents`) is preferred
+ * over the pristine `~/.claude/gsd-core/agents`: GSD's installer injects the
+ * per-agent `effort:` every agent carries and the `disallowedTools:` seven of them
+ * declare, and those two fields are exactly what becomes pi's `thinking:` and
+ * `excludeTools:`. The pristine tree stays as the fallback for an install whose
+ * agents were never staged.
+ *
+ * With an explicit `--source` the search stays inside that tree: an explicit
+ * source is a user instruction about *which* GSD Core copy to convert, and
+ * silently mixing in agents from a different install could pair a command's
+ * workflow with an agent definition from another version.
+ */
+function agentSourceCandidates(opts, coreRoot, sourceDir) {
+  const env = process.env;
+  const claudeHome = env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
+  const list = [];
+  const add = (dir, runtime) => {
+    if (!dir) return;
+    const abs = path.resolve(expandHome(String(dir)));
+    if (!list.some((c) => c.dir === abs)) list.push({ dir: abs, runtime });
+  };
+
+  add(coreRoot && path.join(coreRoot, 'agents'), 'pi-core');
+  if (opts.source) {
+    add(sourceDir && path.resolve(sourceDir, '..', '..', 'agents'), 'source-tree');
+    return list;
+  }
+
+  add(path.join(opts.agentDir, 'gsd-core', 'agents'), 'pi');
+  add(path.join(claudeHome, 'agents'), 'claude');
+  add(path.join(claudeHome, 'gsd-core', 'agents'), 'claude-canonical');
+  add(path.join(opts.cwd, '.claude', 'gsd-core', 'agents'), 'claude(project)');
+  add(path.join(opts.cwd, 'gsd-core', 'agents'), 'repo');
+
+  const homes = [
+    [env.CODEX_HOME || path.join(HOME, '.codex'), 'codex'],
+    [env.CURSOR_CONFIG_DIR || path.join(HOME, '.cursor'), 'cursor'],
+    [env.OPENCODE_CONFIG_DIR || path.join(env.XDG_CONFIG_HOME || path.join(HOME, '.config'), 'opencode'), 'opencode'],
+    [env.GEMINI_CONFIG_DIR || path.join(HOME, '.gemini'), 'gemini'],
+    [path.join(HOME, '.qwen'), 'qwen'],
+    [env.HERMES_HOME || path.join(HOME, '.hermes'), 'hermes'],
+    [env.COPILOT_CONFIG_DIR || path.join(HOME, '.copilot'), 'copilot'],
+  ];
+  for (const [home, runtime] of homes) add(path.join(home, 'gsd-core', 'agents'), runtime);
+
+  // Last resort: the tree the chosen command source itself came from.
+  add(sourceDir && path.resolve(sourceDir, '..', '..', 'agents'), 'source-tree');
+
+  return list;
+}
+
+/**
+ * Count agent files that look like GSD's own Claude-dialect definitions.
+ *
+ * `name: gsd-*` plus a `tools:` key is what separates the canonical set from
+ * Codex `.toml` files, Cursor/Augment's reduced frontmatter, and a user's own
+ * agents living in the same directory. `.compact.md` siblings are excluded by
+ * file name, not by dedupe: they share their canonical agent's `name:` and sort
+ * *before* it (`gsd-x.compact.md` < `gsd-x.md`), so a name-keyed pass would keep
+ * the prompt-length fallback and drop the real agent.
+ */
+function scoreAgentSource(dir) {
+  const valid = [];
+  for (const file of listCommandFiles(dir)) {
+    if (file.endsWith('.compact.md')) continue;
+    const raw = readIfExists(path.join(dir, file));
+    if (!raw) continue;
+    const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(raw);
+    if (!fm) continue;
+    if (!/^name:\s*gsd-/m.test(fm[1])) continue;
+    if (!/^tools:/m.test(fm[1])) continue;
+    // pi-subagents skips definitions without a non-empty description, and our own
+    // discovery must not depend on the source being well-formed.
+    if (!/^description:\s*\S/m.test(fm[1])) continue;
+    valid.push(file);
+  }
+  return valid;
+}
+
+/**
+ * Pick the best available canonical agent source. Never throws: a machine with
+ * commands but no canonical agents is a valid state, so the caller degrades to a
+ * note and the commands still sync.
+ * @returns {object|null} { dir, runtime, valid, candidates }
+ */
+function discoverAgentSource(opts, coreRoot, sourceDir) {
+  const candidates = agentSourceCandidates(opts, coreRoot, sourceDir);
+  const scanned = candidates.map((c) => ({ ...c, valid: scoreAgentSource(c.dir) }));
+  const usable = scanned.filter((c) => c.valid.length > 0);
+  if (usable.length === 0) return null;
+  usable.sort((a, b) => b.valid.length - a.valid.length);
+  const chosen = usable[0];
+  return {
+    dir: chosen.dir,
+    runtime: chosen.runtime,
+    valid: chosen.valid,
+    candidates: scanned.map((c) => ({ dir: c.dir, runtime: c.runtime, agents: c.valid.length })),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Frontmatter
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Minimal YAML frontmatter reader — enough for GSD's command files
- * (scalars plus `key:\n  - item` lists, which are skipped).
- * @returns {{ data: object, body: string }}
+ * Minimal YAML frontmatter reader — enough for GSD's command and agent files
+ * (scalars, `key:\n  - item` block lists, `[a, b]` flow lists, comments).
+ *
+ * `data` always holds the scalar form; `lists` holds the block-list items of any
+ * key that used the `- item` form (`tools:` in `gsd-nyquist-auditor` and
+ * `gsd-security-auditor`). Callers that need either form use `frontmatterList`.
+ *
+ * @returns {{ data: object, body: string, lists: object }}
  */
 function parseFrontmatter(raw) {
   const m = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*\r?\n?/.exec(raw);
-  if (!m) return { data: {}, body: raw };
+  if (!m) return { data: {}, body: raw, lists: {} };
   const data = {};
+  const lists = {};
+  let listKey = null;
   for (const line of m[1].split(/\r?\n/)) {
-    if (!line.trim()) continue;
+    if (!line.trim() || /^\s*#/.test(line)) continue;
+    const item = /^\s+-\s*(.*)$/.exec(line);
+    if (item && listKey) {
+      lists[listKey].push(unquoteYaml(item[1]));
+      continue;
+    }
     if (/^\s/.test(line)) continue; // nested list item / block scalar body
     if (/^-\s/.test(line)) continue;
     const i = line.indexOf(':');
@@ -447,15 +643,184 @@ function parseFrontmatter(raw) {
     const key = line.slice(0, i).trim();
     if (!key) continue;
     let value = line.slice(i + 1).trim();
+    if (value === '') {
+      // Could be a block list, a nested map, or a block scalar — collect items
+      // optimistically and fall back to '' (the previous behaviour).
+      listKey = key;
+      lists[key] = [];
+      data[key] = '';
+      continue;
+    }
+    listKey = null;
     if (value === '|' || value === '>' || /^[|>][-+]?$/.test(value)) value = ''; // block scalar: not needed
     data[key] = unquoteYaml(value);
   }
-  return { data, body: raw.slice(m[0].length) };
+  for (const [key, items] of Object.entries(lists)) {
+    if (items.length) data[key] = items;
+  }
+  return { data, body: raw.slice(m[0].length), lists };
+}
+
+/**
+ * Frontmatter field → string array, tolerating every form GSD uses:
+ * block lists, flow lists (`[Read, Write]`), and comma-separated scalars.
+ */
+function frontmatterList(data, lists, key) {
+  const block = lists && lists[key];
+  if (Array.isArray(block) && block.length) return block.map((v) => String(v).trim()).filter(Boolean);
+  const value = data ? data[key] : undefined;
+  if (Array.isArray(value)) return value.map((v) => String(v).trim()).filter(Boolean);
+  return String(value == null ? '' : value)
+    .replace(/^\[|\]$/g, '')
+    .split(',')
+    .map((s) => s.trim().replace(/^-\s*/, ''))
+    .filter(Boolean);
 }
 
 function buildFrontmatter(description, argumentHint) {
   const lines = ['---', `description: ${yamlQuote(description || 'GSD command')}`];
   if (argumentHint) lines.push(`argument-hint: ${yamlQuote(argumentHint)}`);
+  lines.push('---');
+  return lines.join('\n') + '\n';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent frontmatter → pi-subagents metadata
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Claude tool name → pi builtin tool name.
+ *
+ * Only pi *builtins* belong in a generated allowlist. pi's SDK `tools` option
+ * filters builtins only, so a name the host does not provide is dropped at launch
+ * (a non-fatal warning) — and a list that filters down to nothing leaves the
+ * child session with no tools at all. Extension tools (pi-web-access, MCP) stay
+ * available to the child regardless, because their providers are loaded by the
+ * child session itself.
+ */
+const AGENT_TOOL_MAP = Object.freeze({
+  read: 'read',
+  write: 'write',
+  edit: 'edit',
+  bash: 'bash',
+  grep: 'grep',
+  glob: 'find', // pi's glob-style search tool is `find`
+  ls: 'ls',
+});
+
+/** MCP server → human name for the fallback note written into the agent prompt. */
+const MCP_SERVER_LABELS = Object.freeze({
+  'plugin_context7_context7': 'Context7',
+  context7: 'Context7',
+  exa: 'Exa',
+  firecrawl: 'Firecrawl',
+  tavily: 'Tavily',
+  ref: 'Ref',
+  jina: 'Jina',
+  perplexity: 'Perplexity',
+  'chrome-devtools': 'Chrome DevTools',
+  'claude-in-chrome': 'Claude in Chrome',
+});
+
+/**
+ * Map a GSD agent's `tools:` value onto pi's tool surface.
+ *
+ * Tools that exist in pi are mapped; `Agent`/`AskUserQuestion` become pi's
+ * coordination tools; everything else is dropped and reported as a capability so
+ * the generated prompt can tell the child what to do instead.
+ *
+ * @returns {{ tools: string[], caps: object }}
+ */
+function mapAgentTools(data, lists) {
+  const caps = { nested: false, asks: false, skill: false, web: false, mcp: [], unknown: [], dropped: [] };
+  const tools = [];
+  const push = (tool) => {
+    if (tool && !tools.includes(tool)) tools.push(tool);
+  };
+  for (const raw of frontmatterList(data, lists, 'tools')) {
+    const name = raw.trim();
+    if (!name) continue;
+    const lower = name.toLowerCase();
+    if (AGENT_TOOL_MAP[lower]) {
+      push(AGENT_TOOL_MAP[lower]);
+      continue;
+    }
+    const mcp = /^mcp__(.+?)__(.+)$/.exec(lower);
+    if (mcp) {
+      if (!caps.mcp.includes(mcp[1])) caps.mcp.push(mcp[1]);
+      continue;
+    }
+    if (lower === 'agent' || lower === 'task') {
+      // Claude's nested-spawn tool → pi-subagents' `subagent`.
+      caps.nested = true;
+      push('subagent');
+      continue;
+    }
+    if (lower === 'askuserquestion') {
+      caps.asks = true;
+      push('contact_supervisor');
+      continue;
+    }
+    if (lower === 'skill') {
+      caps.skill = true;
+      continue;
+    }
+    if (lower === 'websearch' || lower === 'webfetch') {
+      caps.web = true;
+      continue;
+    }
+    if (lower === 'multiedit' || lower === 'notebookedit' || lower === 'todowrite') {
+      caps.dropped.push(name); // no pi equivalent; harmless, so no note
+      continue;
+    }
+    caps.unknown.push(name);
+  }
+  caps.dropped = [...new Set(caps.dropped)];
+  caps.unknown = [...new Set(caps.unknown)];
+  return { tools, caps };
+}
+
+/** `disallowedTools:` → pi-subagents `excludeTools:` (same name mapping). */
+function mapAgentDisallowed(data, lists) {
+  const out = [];
+  for (const raw of frontmatterList(data, lists, 'disallowedTools')) {
+    const mapped = AGENT_TOOL_MAP[raw.trim().toLowerCase()];
+    if (mapped && !out.includes(mapped)) out.push(mapped);
+  }
+  return out;
+}
+
+/** pi-subagents thinking levels; GSD's `effort:` values are a subset. */
+const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+/**
+ * GSD `effort:` → pi-subagents `thinking:`.
+ * An unrecognised level is dropped rather than emitted: pi-subagents silently
+ * ignores values outside its level set, so passing it through would only hide the
+ * mismatch from the sync report.
+ */
+function mapAgentEffort(rawEffort) {
+  const level = String(rawEffort == null ? '' : rawEffort)
+    .trim()
+    .toLowerCase();
+  return THINKING_LEVELS.includes(level) ? level : null;
+}
+
+/**
+ * Render the generated agent's frontmatter.
+ * @returns {string} YAML frontmatter block, including the trailing newline
+ */
+function buildAgentFrontmatter({ name, description, tools, excludeTools, thinking, nested, inheritSkills }) {
+  const lines = ['---', `name: ${yamlQuote(name)}`, `description: ${yamlQuote(description)}`];
+  // An empty `tools:` would mean "no tools at all", not "default tools".
+  if (tools.length) lines.push(`tools: ${tools.join(', ')}`);
+  if (excludeTools.length) lines.push(`excludeTools: ${excludeTools.join(', ')}`);
+  if (thinking) lines.push(`thinking: ${thinking}`);
+  if (nested) lines.push('allowNestedSubagents: true');
+  if (inheritSkills) lines.push('inheritSkills: true');
+  // Custom agents drop repository instructions by default; GSD's agents are repo
+  // workers that assume they see the project's conventions.
+  lines.push('inheritProjectContext: true');
   lines.push('---');
   return lines.join('\n') + '\n';
 }
@@ -543,7 +908,7 @@ function rewriteRuntimeNotes(text) {
 }
 
 /**
- * Point other-runtime GSD paths at the pi GSD tree.
+ * Point other-runtime GSD paths at the pi equivalents.
  *
  * GSD's own installer performs exactly this rewrite for pi: the pi tree contains
  * 113 `${CLAUDE_CONFIG_DIR:-$HOME/.pi/agent}` shims and zero `~/.claude/gsd-core`
@@ -552,11 +917,17 @@ function rewriteRuntimeNotes(text) {
  * without the rewrite a pi session in a project with no local `gsd-core/` would
  * find no engine at all.
  *
+ * The same applies to the two paths GSD's text uses for skills and MCP config
+ * (`.claude/skills/` in 32 files, `~/.claude/mcp.json`): on pi those are
+ * `.pi/skills/` + `<agentDir>/skills/` and `.pi/mcp.json` + `<agentDir>/mcp.json`,
+ * and a child following GSD's literal text would otherwise look in a Claude
+ * directory and find nothing.
+ *
  * @returns {{ text: string, count: number }}
  */
 function normalizeRuntimePaths(text, ctx) {
   if (!ctx.coreRoot) return { text: String(text), count: 0 };
-  const homeDir = path.dirname(ctx.coreRoot);
+  const homeDir = ctx.agentDir || path.dirname(ctx.coreRoot);
   let count = 0;
   const bump = (replacement) => {
     count += 1;
@@ -566,7 +937,16 @@ function normalizeRuntimePaths(text, ctx) {
     .replace(/\$\{CLAUDE_CONFIG_DIR:-\$HOME\/\.claude\}/g, () => bump(`\${CLAUDE_CONFIG_DIR:-${homeDir}}`))
     .replace(/\$\{HOME\}\/\.claude\/gsd-core/g, () => bump(ctx.coreRoot))
     .replace(/\$HOME\/\.claude\/gsd-core/g, () => bump(ctx.coreRoot))
-    .replace(/~\/\.claude\/gsd-core/g, () => bump(ctx.coreRoot));
+    .replace(/~\/\.claude\/gsd-core/g, () => bump(ctx.coreRoot))
+    .replace(/\$\{HOME\}\/\.claude\/skills/g, () => bump(`${homeDir}/skills`))
+    .replace(/\$HOME\/\.claude\/skills/g, () => bump(`${homeDir}/skills`))
+    .replace(/~\/\.claude\/skills/g, () => bump(`${homeDir}/skills`))
+    .replace(/\$\{HOME\}\/\.claude\/mcp\.json/g, () => bump(`${homeDir}/mcp.json`))
+    .replace(/\$HOME\/\.claude\/mcp\.json/g, () => bump(`${homeDir}/mcp.json`))
+    .replace(/~\/\.claude\/mcp\.json/g, () => bump(`${homeDir}/mcp.json`))
+    // Project-relative skill root. The lookbehind keeps absolute non-home paths
+    // (a genuine Claude install elsewhere) and `my.claude/…` untouched.
+    .replace(/(?<![\w./~-])\.claude\/skills/g, () => bump('.pi/skills'));
   return { text: out, count };
 }
 function buildColonPattern(names) {
@@ -622,9 +1002,67 @@ function inlineContext(text, { baseDir, ctx, seen, depth = 0, acc }) {
 // Conversion
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * The parent-side contract that turns GSD's spawn steps into pi-subagents calls.
+ *
+ * GSD's workflows are written for Claude Code's `Agent` tool, and GSD's own
+ * dispatch resolver (`gsd_run query resolve-dispatch-type`) answers for a runtime
+ * whose descriptor says named dispatch is unavailable — on pi it replies
+ * `coder`/`explore`/`plan`, which are another runtime's built-ins and do not
+ * exist here. Without this block a session either follows that answer into a
+ * failed spawn or quietly skips the delegation.
+ *
+ * @returns {string[]} lines to append after the runtime contract
+ */
+function subagentDispatchBlock(agents) {
+  const core = [];
+  core.push(`<gsd_subagent_dispatch agents="${agents.names.length}" dir="${agents.dir}">`);
+  core.push(
+    'GSD\u2019s agent definitions are installed as pi-subagents agents, so GSD\u2019s spawn steps must be translated:',
+  );
+  core.push(
+    '  \u2022 `Agent(subagent_type="gsd-planner", model="\u2026", prompt="\u2026")` \u2192 ' +
+      '`subagent({ agent: "gsd-planner", task: "\u2026" })`',
+  );
+  core.push('  \u2022 `run_in_background: false` \u2192 `async: false` (block and wait for the result); `true` or absent \u2192 leave `async` off (background is the default).');
+  core.push(
+    '  \u2022 `model="{PLANNER_MODEL}"` and friends are unresolved placeholders here \u2014 omit `model` so the agent\u2019s ' +
+      'own default applies, or pass an exact `provider/id` copied from `subagent({action:"models"})`.',
+  );
+  core.push('  \u2022 `subagent_type="general-purpose"` \u2192 `agent: "delegate"`.');
+  core.push(
+    '  \u2022 `TaskOutput` and any "wait for the subagent" step \u2192 `subagent({action:"status", id})` ' +
+      '(an agent id is not a task id, which is why GSD warns about this); a background child also wakes you when it finishes.',
+  );
+  core.push(
+    '  \u2022 Several spawns in one step \u2192 one `subagent({ workflowScript })` call with ' +
+      '`const [a, b] = await runs.all([{ key, agent, task }, \u2026])` and an explicit `return`.',
+  );
+  core.push(
+    '  \u2022 Ignore what `gsd_run query resolve-dispatch-type` answers on pi: it maps every role to ' +
+      '`coder`/`explore`/`plan`, which do not exist in pi. Dispatch the `gsd-*` role name itself.',
+  );
+  core.push(
+    '  \u2022 Spawn agents that need web or MCP lookups as background children: a foreground child ' +
+      '(`async: false`) does not load the installed pi extension packages. Use `async: false` only where GSD ' +
+      'explicitly requires a blocking spawn (its debug session manager).',
+  );
+  core.push(`  \u2022 Installed roles: ${agents.names.map((n) => `\`${n}\``).join(', ')}.`);
+  core.push(
+    '  \u2022 Confirm a role with `subagent({action:"list", capabilities:true})`, and give a spawned agent the same ' +
+      'task text GSD\u2019s `prompt` would have used.',
+  );
+  core.push(
+    '  \u2022 If a spawn genuinely cannot run, do that step yourself in this session \u2014 never skip it.',
+  );
+  core.push('</gsd_subagent_dispatch>');
+  return core;
+}
+
 function runtimeContract({ name, description, argumentHint, data, ctx, mode, refs, maxInlineKb }) {
   const coreRoot = ctx.coreRoot;
   const toolsPath = coreRoot ? path.join(coreRoot, 'bin', 'gsd-tools.cjs') : null;
+  const agents = ctx.agents || { enabled: false, names: [], dir: '' };
   const lines = [];
   lines.push(`<gsd_command name="/gsd-${name}" source="gsd:${name}" gsd_core="${ctx.version}" runtime="pi" mode="${mode}">`);
   lines.push('<runtime_contract>');
@@ -662,10 +1100,18 @@ function runtimeContract({ name, description, argumentHint, data, ctx, mode, ref
       'numbered list of options and wait for the answer. With `--text` (or `workflow.text_mode: true`), ' +
       'always use plain-text numbered lists.',
   );
-  item(
-    'Subagents: where GSD says to spawn an agent (e.g. `gsd-planner`, `gsd-executor`), use pi\u2019s ' +
-      'subagent tooling if that agent is registered; otherwise do that step inline yourself rather than skipping it.',
-  );
+  if (agents.enabled && agents.names.length) {
+    item(
+      'Subagents: every GSD role agent is installed for pi-subagents. GSD writes its spawn steps in Claude Code\u2019s ' +
+        '`Agent(...)` form and GSD\u2019s own dispatch query answers for a different runtime — <gsd_subagent_dispatch> ' +
+        'below has the translation and the rules.',
+    );
+  } else {
+    item(
+      'Subagents: where GSD says to spawn an agent (e.g. `gsd-planner`, `gsd-executor`), use pi\u2019s ' +
+        'subagent tooling if that agent is registered; otherwise do that step inline yourself rather than skipping it.',
+    );
+  }
   if (toolsPath) {
     item(
       `GSD core for this runtime: \`${coreRoot}\` — CLI: \`node ${toolsPath} <family> <subcommand> [args]\` ` +
@@ -693,6 +1139,10 @@ function runtimeContract({ name, description, argumentHint, data, ctx, mode, ref
     lines.push(...extra);
   }
   lines.push('</runtime_contract>');
+  if (agents.enabled && agents.names.length) {
+    lines.push('');
+    lines.push(...subagentDispatchBlock(agents));
+  }
   lines.push('');
   lines.push(`<user_arguments>$ARGUMENTS</user_arguments>`);
   lines.push('');
@@ -799,6 +1249,223 @@ function convertCommand(raw, name, ctx) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Agent conversion
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The runtime contract prepended to every generated agent prompt.
+ *
+ * A subagent's system prompt is handed to the child session as-is (pi-subagents
+ * does not run prompt-template substitution on it), so everything the child needs
+ * to adapt GSD's Claude-Code assumptions has to be stated here — and anything
+ * without a pi tool is named here rather than in the frontmatter, where a tool
+ * that cannot resolve would be dropped or, for `mcp:` selectors, abort the spawn.
+ */
+function agentRuntimeContract({ name, ctx, mode, refs }) {
+  const coreRoot = ctx.coreRoot;
+  const toolsPath = coreRoot ? path.join(coreRoot, 'bin', 'gsd-tools.cjs') : null;
+  const caps = ctx.caps || {};
+  const lines = [];
+  lines.push(`<pi_runtime_contract agent="${name}" runtime="pi" mode="${mode}" gsd_core="${ctx.version}">`);
+  lines.push(
+    'You are a pi (pi.dev) subagent session running one of GSD Core\u2019s agent definitions. ' +
+      'The persona below is GSD\u2019s own text, converted for pi — follow its process, gates, and output contract.',
+  );
+  lines.push('');
+  let step = 0;
+  const item = (text) => {
+    step += 1;
+    lines.push(`${step}. ${text}`);
+  };
+  if (mode === 'reference' && refs.length > 0) {
+    item(
+      'FIRST, before you act, read every file listed under <gsd_must_read> with the `read` tool, in full. ' +
+        'They are part of this agent\u2019s GSD definition, and GSD text that points at them assumes their contents are in front of you.',
+    );
+  } else if (mode === 'inline' && refs.length > 0) {
+    item('The files this agent references are inlined below — treat them as part of your instructions.');
+  }
+  item(
+    'Slash commands in pi use the hyphen form: `/gsd-<name>`. Wherever GSD text says `/gsd:<name>`, use `/gsd-<name>`.',
+  );
+  if (toolsPath) {
+    item(
+      `GSD core for this runtime: \`${coreRoot}\` — CLI: \`node ${toolsPath} <family> <subcommand> [args]\` ` +
+        "(GSD's workflows define a `gsd_run` shell shim that resolves this automatically).",
+    );
+  }
+  item(
+    '`$ARGUMENTS` or `$@` in any GSD text you read means the task the orchestrator handed you — it is literal here, ' +
+      'never substituted.',
+  );
+  if (caps.skill) {
+    item(
+      '`Skill` is not a tool in pi: where GSD tells you to invoke a skill, read that skill\u2019s `SKILL.md` yourself ' +
+        '(project skills live in `.pi/skills/` and `.agents/skills/`) or follow the matching `/gsd-<command>` workflow instead.',
+    );
+  }
+  if (caps.asks) {
+    item(
+      '`AskUserQuestion` does not exist in pi. When you would ask the user, call `contact_supervisor` with ' +
+        '`reason: "need_decision"` — the orchestrator relays it and replies with the answer. If that tool is not ' +
+        'available in this session, put the question in your final report and continue with the safest ' +
+        'assumption rather than waiting.',
+    );
+  }
+  if (caps.web || caps.mcp.length > 0) {
+    // Server names are deduped by label: GSD lists Context7 under two spellings.
+    const wanted = [
+      ...(caps.web ? ['web search / page fetching'] : []),
+      ...new Set(caps.mcp.map((server) => MCP_SERVER_LABELS[server] || server)),
+    ];
+    item(
+      `This agent asks for ${wanted.join(', ')}, which GSD reaches through MCP or host search tools. pi has no MCP ` +
+        'server wired to this agent: use the installed pi web tools (`web_search`, `fetch_content`, ' +
+        '`get_search_content`) when they are present in the session, and GSD\u2019s own CLI fallback otherwise ' +
+        '(for Context7: `ctx7 library <name> "<query>"` / `ctx7 docs <libraryId> "<query>"`, never `npx --yes ctx7@latest`). ' +
+        'Those tools only exist in background child sessions, so if a lookup tool is missing, say so in your report ' +
+        'instead of stalling.',
+    );
+  }
+  if (caps.nested) {
+    item(
+      'You may spawn further subagents with `subagent({ agent, task })` using the GSD roles you need ' +
+        '(for example `gsd-debugger`), and collect their results before you finish.',
+    );
+  }
+  if (caps.unknown.length) {
+    item(`Tools GSD grants this agent that pi has no equivalent for (do not wait for them): ${caps.unknown.join(', ')}.`);
+  }
+  item(
+    'Your final message is the only thing the orchestrator receives: report the files you wrote, the evidence you ' +
+      'produced, and any open question — keep it short and concrete.',
+  );
+  lines.push('</pi_runtime_contract>');
+  lines.push('');
+  return lines.join('\n');
+}
+
+/**
+ * Convert one GSD agent definition into a pi-subagents agent definition.
+ *
+ * Mirrors `convertCommand`, except that shell-token protection is deliberately
+ * skipped: an agent body becomes a session system prompt, which pi never runs
+ * through `substituteArgs`, so rewriting `"$@"` would only make the child's copy
+ * differ from GSD's.
+ *
+ * @returns {{ content: string, mode: string, refs: string[], caps: object, notes: string[] }}
+ */
+function convertAgent(raw, name, ctx) {
+  const { data, body, lists } = parseFrontmatter(raw);
+  const description = String(data.description || '').trim() || `GSD ${name} agent`;
+  const { tools, caps } = mapAgentTools(data, lists);
+  // Several agents dispatch or load skills without ever declaring the Claude
+  // `Skill` tool (`gsd-debug-session-manager` maps a hint to a skill to invoke,
+  // `gsd-intel-updater` walks project `skills/` directories). They still need pi's
+  // skills catalogue to work the same way.
+  if (!caps.skill && /(\/skill:|\bskill\(|skills?\/|SKILL\.md|skill to invoke)/i.test(body)) caps.skill = true;
+  const excludeTools = mapAgentDisallowed(data, lists);
+  const thinking = mapAgentEffort(data.effort);
+  const rosterPattern = ctx.rosterPattern;
+  const notes = [];
+
+  // Collect the referenced files before any rewriting, exactly as the command
+  // converter does. Refs that do not resolve inside the GSD tree (project files
+  // like `.planning/PROJECT.md`) stay untouched on purpose. Keyed by resolved
+  // path as well as by raw text: the same file is often referenced twice, once as
+  // `@~/.claude/…` and once as `@gsd-core/…`.
+  const refMap = new Map(); // raw ref → resolved absolute path
+  const refs = [];
+  {
+    const re = new RegExp(REF_RE.source, 'g');
+    let m;
+    while ((m = re.exec(body)) !== null) {
+      const abs = resolveCoreRef(m[1], ctx.srcDir, ctx);
+      if (!abs) continue;
+      refMap.set(m[1], abs);
+      if (!refs.includes(abs)) refs.push(abs);
+    }
+  }
+
+  let mode = ctx.mode;
+  let inlined = { text: '', bytes: 0, files: [], truncated: [] };
+  if (mode === 'inline' && refs.length > 0) {
+    inlined = inlineContext(body, { baseDir: ctx.srcDir, ctx, seen: new Set(), depth: 0 });
+    if (ctx.maxInlineKb > 0 && inlined.bytes / 1024 > ctx.maxInlineKb) {
+      notes.push(
+        `inline context ${(inlined.bytes / 1024).toFixed(1)}KB exceeds maxInlineKb=${ctx.maxInlineKb} — used reference mode`,
+      );
+      mode = 'reference';
+      inlined = { text: '', bytes: 0, files: [], truncated: [] };
+    }
+  }
+
+  let bodyOut;
+  if (mode === 'inline' && inlined.text) {
+    bodyOut = inlined.text;
+  } else {
+    // Reference mode: the include becomes the absolute path in the pi GSD tree
+    // (pi has no `@file` expansion), and the must-read list below names them all.
+    bodyOut = body.replace(new RegExp(REF_RE.source, 'g'), (match, ref) => refMap.get(ref) || match);
+  }
+
+  const runtimeNotes = rewriteRuntimeNotes(bodyOut);
+  bodyOut = runtimeNotes.text;
+  if (runtimeNotes.count) notes.push(`rewrote ${runtimeNotes.count} runtime-specific question note(s) for pi`);
+
+  const paths = normalizeRuntimePaths(bodyOut, ctx);
+  bodyOut = paths.text;
+  if (paths.count) notes.push(`pointed ${paths.count} runtime path reference(s) at the pi GSD tree`);
+
+  const colon = normalizeColonCommands(bodyOut, ctx.roster, rosterPattern);
+  bodyOut = colon.text;
+  if (colon.count) notes.push(`normalized ${colon.count} /gsd:<cmd> reference(s) to /gsd-<cmd>`);
+
+  if (caps.dropped.length) notes.push(`dropped tool(s) with no pi equivalent: ${caps.dropped.join(', ')}`);
+  if (caps.unknown.length) notes.push(`unknown tool(s) kept out of the allowlist: ${caps.unknown.join(', ')}`);
+  if (data.effort && !thinking) notes.push(`effort "${data.effort}" is not a pi thinking level — dropped`);
+
+  const mustRead =
+    mode === 'reference' && refs.length
+      ? '<gsd_must_read>\n' +
+        'Read these files now, in full — they are part of this agent\u2019s GSD definition:\n' +
+        refs.map((abs, i) => `${i + 1}. ${abs}`).join('\n') +
+        '\n</gsd_must_read>\n'
+      : '';
+
+  const content =
+    buildAgentFrontmatter({
+      name,
+      description,
+      tools,
+      excludeTools,
+      thinking,
+      nested: caps.nested,
+      inheritSkills: caps.skill,
+    }) +
+    // Deliberately timestamp-free: the generated bytes must be a pure function of
+    // the source so that re-running the sync is a no-op (the sync time lives in
+    // the state file instead).
+    `${MARKER_PREFIX} v${GENERATOR_VERSION} · GSD Core ${ctx.version} · do not edit — run /gsd-sync -->\n` +
+    agentRuntimeContract({ name, ctx: { ...ctx, caps }, mode, refs }) +
+    (mustRead ? `\n${mustRead}` : '') +
+    `\n${bodyOut.trim()}\n`;
+
+  return {
+    content,
+    mode,
+    caps,
+    tools,
+    excludeTools,
+    thinking,
+    inlinedBytes: inlined.bytes,
+    inlinedFiles: inlined.files,
+    refs: refs.map((abs) => relativeTo(ctx.coreRoot || ctx.srcDir, abs)),
+    notes,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Sync
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -821,6 +1488,163 @@ function writeFileAtomic(target, content) {
   const tmp = `${target}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, content, 'utf8');
   fs.renameSync(tmp, target);
+}
+
+/**
+ * Convert GSD's agent definitions into pi-subagents agent definitions and
+ * reconcile the output directory.
+ *
+ * Same ownership rule as the command templates: the generated files are named
+ * here, recorded in the agents state file, and carry a generator marker; a file
+ * that is neither is left alone, and a file this plugin would overwrite but does
+ * not own is reported instead of clobbered.
+ *
+ * @returns {void} mutates `report.agents`
+ */
+function syncAgents(opts, ctx, source, agentSource, report) {
+  const out = report.agents;
+  const statePath = path.join(opts.agentsOut, AGENTS_STATE_FILE);
+
+  if (path.resolve(opts.agentsOut) === path.resolve(opts.outDir)) {
+    out.errors.push(
+      `agent output ${opts.agentsOut} is the same directory as the command output — refusing to mix ` +
+        'prompt templates and agent definitions (use --agents-out)',
+    );
+    return;
+  }
+  if (agentSource.valid.length < MIN_SOURCE_AGENTS && !opts.force) {
+    out.errors.push(
+      `agent source ${agentSource.dir} exposes only ${agentSource.valid.length} agent(s) (min ${MIN_SOURCE_AGENTS}); ` +
+        'refusing to regenerate — re-run with --force to override',
+    );
+    return;
+  }
+
+  const previous = readState(statePath);
+  const previousFiles = (previous && previous.files) || {};
+  const fingerprintParts = {
+    generator: `${GENERATOR}@${GENERATOR_VERSION}`,
+    kind: 'agents',
+    mode: opts.mode,
+    maxInlineKb: opts.maxInlineKb,
+    source: agentSource.dir,
+    coreRoot: ctx.coreRoot,
+    version: ctx.version,
+    agents: [],
+  };
+  const outputs = [];
+  for (const fileName of agentSource.valid) {
+    const name = fileName.replace(/\.md$/, '');
+    const raw = readIfExists(path.join(agentSource.dir, fileName));
+    if (raw == null) {
+      out.warnings.push(`unreadable: ${fileName}`);
+      continue;
+    }
+    fingerprintParts.agents.push([name, sha256(raw)]);
+    try {
+      const converted = convertAgent(raw, name, { ...ctx, srcDir: agentSource.dir });
+      outputs.push({ outName: `${name}.md`, name, content: converted.content, info: converted });
+    } catch (err) {
+      out.errors.push(`convert ${name}: ${err && err.message ? err.message : String(err)}`);
+    }
+  }
+
+  const fingerprint = computeFingerprint(fingerprintParts);
+  out.fingerprint = fingerprint;
+  out.count = outputs.length;
+
+  if (!opts.dryRun) {
+    try {
+      fs.mkdirSync(opts.agentsOut, { recursive: true });
+    } catch (err) {
+      out.errors.push(`cannot create ${opts.agentsOut}: ${err && err.message ? err.message : String(err)}`);
+      return;
+    }
+  }
+
+  const nextFiles = {};
+  const generatedNames = new Set(outputs.map((o) => o.outName));
+  for (const entry of outputs) {
+    const target = path.join(opts.agentsOut, entry.outName);
+    const existing = readIfExists(target);
+    nextFiles[entry.outName] = {
+      sha256: sha256(entry.content),
+      mode: entry.info.mode,
+      tools: entry.info.tools,
+      thinking: entry.info.thinking,
+      refs: entry.info.refs.length,
+    };
+    for (const note of entry.info.notes) out.notes.push(`${entry.outName}: ${note}`);
+    if (existing == null) {
+      out.added.push(entry.outName);
+    } else if (existing === entry.content) {
+      out.unchanged.push(entry.outName);
+      continue;
+    } else {
+      const wasOurs = Object.prototype.hasOwnProperty.call(previousFiles, entry.outName);
+      const marked = !wasOurs && existing.slice(0, MARKER_SCAN_BYTES).includes(MARKER_PREFIX);
+      if (!wasOurs && !marked && !opts.force) {
+        // Somebody's own agent with a colliding name — never overwrite it.
+        out.skipped.push(entry.outName);
+        out.warnings.push(`${entry.outName} exists and was not generated by ${GENERATOR} — left untouched (--force overwrites)`);
+        delete nextFiles[entry.outName];
+        out.count -= 1;
+        continue;
+      }
+      out.updated.push(entry.outName);
+    }
+    if (!opts.dryRun) {
+      try {
+        writeFileAtomic(target, entry.content);
+      } catch (err) {
+        out.errors.push(`write ${entry.outName}: ${err && err.message ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  // ── prune stale generated agents ──────────────────────────────────────────
+  for (const f of listCommandFiles(opts.agentsOut)) {
+    if (!f.startsWith('gsd-') || generatedNames.has(f)) continue;
+    const wasOurs = Object.prototype.hasOwnProperty.call(previousFiles, f);
+    let marked = false;
+    if (!wasOurs) {
+      const head = readIfExists(path.join(opts.agentsOut, f));
+      marked = head != null && head.slice(0, MARKER_SCAN_BYTES).includes(MARKER_PREFIX);
+    }
+    if (!wasOurs && !marked) {
+      out.skipped.push(f); // somebody else's agent — never touch it
+      continue;
+    }
+    out.removed.push(f);
+    if (!opts.dryRun) {
+      try {
+        fs.unlinkSync(path.join(opts.agentsOut, f));
+      } catch (err) {
+        out.warnings.push(`could not remove ${f}: ${err && err.message ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  if (!opts.dryRun) {
+    const state = {
+      schema: 1,
+      generator: `${GENERATOR}@${GENERATOR_VERSION}`,
+      generatedAt: new Date().toISOString(),
+      fingerprint,
+      mode: opts.mode,
+      maxInlineKb: opts.maxInlineKb,
+      source: { dir: agentSource.dir, runtime: agentSource.runtime, version: source.version },
+      coreRoot: ctx.coreRoot,
+      outDir: opts.agentsOut,
+      files: nextFiles,
+    };
+    try {
+      fs.mkdirSync(opts.agentsOut, { recursive: true });
+      writeFileAtomic(statePath, `${JSON.stringify(state, null, 2)}\n`);
+    } catch (err) {
+      out.errors.push(`state write failed: ${err && err.message ? err.message : String(err)}`);
+    }
+  }
 }
 
 /**
@@ -861,6 +1685,24 @@ function sync(flags = {}) {
     notes: [],
     warnings: [],
     errors: [],
+    // Present on every return path so callers never have to guard for it, even
+    // when the command source turns out to be unusable.
+    agents: {
+      enabled: !!opts.syncAgents,
+      dir: opts.agentsOut,
+      source: null,
+      sourceRuntime: null,
+      count: 0,
+      added: [],
+      updated: [],
+      unchanged: [],
+      removed: [],
+      skipped: [],
+      notes: [],
+      warnings: [],
+      errors: [],
+      fingerprint: null,
+    },
     startedAt: new Date().toISOString(),
   };
 
@@ -869,6 +1711,7 @@ function sync(flags = {}) {
     source = discoverSource(opts);
   } catch (err) {
     report.errors.push(err && err.message ? err.message : String(err));
+    report.agents.notes.push('not attempted — no command source to derive them from');
     return report;
   }
   report.source = source.dir;
@@ -881,6 +1724,7 @@ function sync(flags = {}) {
       `source ${source.dir} exposes only ${source.valid.length} command(s) (min ${MIN_SOURCE_COMMANDS}); ` +
         'refusing to regenerate — re-run with --force to override',
     );
+    report.agents.notes.push('not attempted — the whole run was refused');
     return report;
   }
 
@@ -888,6 +1732,7 @@ function sync(flags = {}) {
     srcDir: source.dir,
     coreRoot: source.coreRoot || path.resolve(source.dir, '..', '..'),
     engineRoot: source.coreRoot ? path.dirname(source.coreRoot) : opts.agentDir,
+    agentDir: opts.agentDir,
     version: source.version,
     mode: opts.mode,
     naming: opts.naming,
@@ -901,6 +1746,24 @@ function sync(flags = {}) {
     report.warnings.push(
       `no pi GSD core tree found beside ${source.dir}; context paths will point at the source tree instead`,
     );
+  }
+
+  // ── agents: resolved before the command loop ──────────────────────────────
+  // Every generated command tells the model which `gsd-*` agents exist, so the
+  // agent roster has to be known before the templates are rendered.
+  const agentSource = opts.syncAgents ? discoverAgentSource(opts, source.coreRoot, source.dir) : null;
+  const agentNames = agentSource ? agentSource.valid.map((f) => f.replace(/\.md$/, '')).sort() : [];
+  ctx.agents = { enabled: !!agentSource, names: agentNames, dir: opts.agentsOut };
+  report.agents.source = agentSource ? agentSource.dir : null;
+  report.agents.sourceRuntime = agentSource ? agentSource.runtime : null;
+  if (!opts.syncAgents) {
+    report.agents.notes.push('agent sync disabled (--no-agents)');
+  } else if (!agentSource) {
+    report.agents.notes.push(
+      `no canonical agents/gsd-*.md directory found${opts.source ? ' beside the explicit --source' : ''} — skipped`,
+    );
+  } else if (agentSource.runtime !== 'pi-core' && agentSource.runtime !== 'pi') {
+    report.agents.notes.push(`agent definitions come from the ${agentSource.runtime} install`);
   }
 
   // ── generate ───────────────────────────────────────────────────────────────
@@ -917,6 +1780,9 @@ function sync(flags = {}) {
     coreRoot: ctx.coreRoot,
     version: source.version,
     commands: [],
+    // The roster is embedded in every template's dispatch contract, so a change
+    // to the agent set invalidates the command templates too.
+    agents: { enabled: !!agentSource, names: agentNames },
   };
 
   for (const fileName of source.valid) {
@@ -998,7 +1864,7 @@ function sync(flags = {}) {
     let marked = false;
     if (!wasOurs) {
       const head = readIfExists(path.join(opts.outDir, f));
-      marked = head != null && head.slice(0, 400).includes(MARKER_PREFIX);
+      marked = head != null && head.slice(0, MARKER_SCAN_BYTES).includes(MARKER_PREFIX);
     }
     if (!wasOurs && !marked) {
       report.skipped.push(f); // somebody else's template — never touch it
@@ -1013,8 +1879,18 @@ function sync(flags = {}) {
       }
     }
   }
+  // ── agents: same pipeline, different artifact ─────────────────────────────
+  if (opts.syncAgents && agentSource) {
+    syncAgents(opts, ctx, source, agentSource, report);
+  }
 
-  report.changed = report.added.length > 0 || report.updated.length > 0 || report.removed.length > 0;
+  report.changed =
+    report.added.length > 0 ||
+    report.updated.length > 0 ||
+    report.removed.length > 0 ||
+    report.agents.added.length > 0 ||
+    report.agents.updated.length > 0 ||
+    report.agents.removed.length > 0;
   report.inSync = stateInSync && !report.changed && outputs.length > 0;
 
   if (!opts.dryRun) {
@@ -1042,16 +1918,19 @@ function sync(flags = {}) {
   // Explicit generation flags are persisted so the automatic sync (which only
   // sees env + config) does not revert them on the next session start.
   // `persist: false` (CLI: --no-persist) keeps a run strictly one-off.
-  if (!opts.dryRun && flags.persist !== false && report.errors.length === 0) {
+  // `--out` / `--agents-out` stay transient: they say where to write this run.
+  if (!opts.dryRun && flags.persist !== false && report.errors.length === 0 && report.agents.errors.length === 0) {
     const patch = {};
     if (flags.mode !== undefined) patch.mode = opts.mode;
     if (flags.naming !== undefined) patch.naming = opts.naming;
     if (flags.maxInlineKb !== undefined) patch.maxInlineKb = opts.maxInlineKb;
     if (flags.source !== undefined) patch.source = opts.source;
+    if (flags.agents !== undefined) patch.syncAgents = opts.syncAgents;
+    if (flags.noAgents !== undefined) patch.syncAgents = opts.syncAgents;
     const persisted = persistConfig(opts.agentDir, patch);
     if (persisted.length) report.notes.push(`persisted to ${CONFIG_FILE}: ${persisted.join(', ')}`);
   }
-  report.ok = report.errors.length === 0;
+  report.ok = report.errors.length === 0 && report.agents.errors.length === 0;
   report.finishedAt = new Date().toISOString();
   return report;
 }
@@ -1062,12 +1941,31 @@ function status(flags = {}) {
   const statePath = path.join(opts.outDir, STATE_FILE);
   const previous = readState(statePath);
   const files = listCommandFiles(opts.outDir).filter((f) => f.startsWith('gsd-') || f.startsWith('gsd:'));
+  const agentStatePath = path.join(opts.agentsOut, AGENTS_STATE_FILE);
+  const previousAgents = readState(agentStatePath);
+  const agentFiles = listCommandFiles(opts.agentsOut).filter((f) => f.startsWith('gsd-'));
   const info = {
     ok: false,
     outDir: opts.outDir,
     agentDir: opts.agentDir,
     exists: isDir(opts.outDir),
     templates: files.length,
+    agents: {
+      enabled: opts.syncAgents,
+      dir: opts.agentsOut,
+      count: agentFiles.length,
+      state: previousAgents
+        ? {
+            generator: previousAgents.generator,
+            generatedAt: previousAgents.generatedAt,
+            version: previousAgents.source && previousAgents.source.version,
+            source: previousAgents.source && previousAgents.source.dir,
+            files: previousAgents.files ? Object.keys(previousAgents.files).length : 0,
+          }
+        : null,
+      stale: null,
+      warnings: [],
+    },
     state: previous
       ? {
           generator: previous.generator,
@@ -1081,15 +1979,33 @@ function status(flags = {}) {
           files: previous.files ? Object.keys(previous.files).length : 0,
         }
       : null,
-    configured: { mode: opts.mode, naming: opts.naming, maxInlineKb: opts.maxInlineKb, autoSync: opts.autoSync },
+    configured: {
+      mode: opts.mode,
+      naming: opts.naming,
+      maxInlineKb: opts.maxInlineKb,
+      autoSync: opts.autoSync,
+      syncAgents: opts.syncAgents,
+    },
     errors: [],
     warnings: [],
     stale: null,
   };
+  // pi-subagents only reads PI_CODING_AGENT_DIR; a TAU-only override would send
+  // the agents to a directory nothing loads.
+  if (opts.syncAgents && process.env.TAU_CODING_AGENT_DIR && !process.env.PI_CODING_AGENT_DIR) {
+    info.agents.warnings.push(
+      'TAU_CODING_AGENT_DIR is set without PI_CODING_AGENT_DIR: pi-subagents resolves its agent directory from ' +
+        'PI_CODING_AGENT_DIR only, so the generated agents would not be discovered. Set PI_CODING_AGENT_DIR too.',
+    );
+  }
   try {
     const source = discoverSource(opts);
     info.source = { dir: source.dir, runtime: source.runtime, version: source.version, commands: source.valid.length };
     info.coreRoot = source.coreRoot;
+    const agentSource = opts.syncAgents ? discoverAgentSource(opts, source.coreRoot, source.dir) : null;
+    if (agentSource) {
+      info.agents.source = { dir: agentSource.dir, runtime: agentSource.runtime, agents: agentSource.valid.length };
+    }
     const fingerprintParts = {
       generator: `${GENERATOR}@${GENERATOR_VERSION}`,
       mode: opts.mode,
@@ -1099,6 +2015,10 @@ function status(flags = {}) {
       coreRoot: source.coreRoot || path.resolve(source.dir, '..', '..'),
       version: source.version,
       commands: source.valid.map((f) => [f.replace(/\.md$/, ''), sha256(readIfExists(path.join(source.dir, f)) || '')]),
+      agents: {
+        enabled: !!agentSource,
+        names: agentSource ? agentSource.valid.map((f) => f.replace(/\.md$/, '')).sort() : [],
+      },
     };
     const fingerprint = computeFingerprint(fingerprintParts);
     info.fingerprint = fingerprint;
@@ -1110,10 +2030,36 @@ function status(flags = {}) {
       previous.generator !== `${GENERATOR}@${GENERATOR_VERSION}` ||
       previous.mode !== opts.mode ||
       previous.naming !== opts.naming;
+    if (opts.syncAgents && agentSource) {
+      // Must stay byte-comparable with the parts `syncAgents` records, unreadable
+      // files dropped the same way, or a run would report itself stale forever.
+      const agentParts = [];
+      for (const f of agentSource.valid) {
+        const raw = readIfExists(path.join(agentSource.dir, f));
+        if (raw == null) continue;
+        agentParts.push([f.replace(/\.md$/, ''), sha256(raw)]);
+      }
+      const agentFingerprint = computeFingerprint({
+        generator: `${GENERATOR}@${GENERATOR_VERSION}`,
+        kind: 'agents',
+        mode: opts.mode,
+        maxInlineKb: opts.maxInlineKb,
+        source: agentSource.dir,
+        coreRoot: source.coreRoot || path.resolve(source.dir, '..', '..'),
+        version: source.version,
+        agents: agentParts,
+      });
+      info.agents.fingerprint = agentFingerprint;
+      info.agents.stale = !previousAgents || previousAgents.fingerprint !== agentFingerprint;
+      info.stale = info.stale || info.agents.stale;
+    } else {
+      info.agents.stale = false;
+    }
     info.ok = true;
   } catch (err) {
     info.errors.push(err && err.message ? err.message : String(err));
     info.stale = files.length === 0;
+    info.agents.stale = agentFiles.length === 0;
   }
   return info;
 }
@@ -1138,6 +2084,18 @@ function formatStatus(info) {
     L.push(`  pi core     ${info.coreRoot || '(missing)'}`);
   }
   L.push(`  fingerprint ${info.fingerprint ? info.fingerprint.slice(0, 16) : '?'} ${info.stale === true ? '(STALE — run /gsd-sync)' : info.stale === false ? '(up to date)' : ''}`);
+  const A = info.agents || {};
+  if (A.enabled === false) {
+    L.push('  agents      disabled (--no-agents)');
+  } else {
+    L.push(
+      `  agents      ${A.count || 0} in ${A.dir}` +
+        (A.state ? `  (GSD Core ${A.state.version || '?'}, generated ${A.state.generatedAt})` : '  (never synced)') +
+        (A.stale === true ? '  · STALE' : ''),
+    );
+    if (A.source) L.push(`  agent src   ${A.source.runtime} · ${A.source.agents} definitions · ${A.source.dir}`);
+    for (const w of A.warnings || []) L.push(`  ! ${w}`);
+  }
   L.push(`  autosync    ${info.configured.autoSync ? 'on' : 'off'}  ·  mode ${info.configured.mode}  ·  naming ${info.configured.naming}${info.configured.maxInlineKb ? `  ·  maxInlineKb ${info.configured.maxInlineKb}` : ''}`);
   for (const w of info.warnings) L.push(`  ! ${w}`);
   for (const e of info.errors) L.push(`  ✗ ${e}`);
@@ -1159,15 +2117,41 @@ function formatReport(report) {
       (report.inlinedBytes ? ` · ${(report.inlinedBytes / 1024).toFixed(0)} KB inlined` : '') +
       ` · ${(report.bytes / 1024).toFixed(0)} KB written`,
   );
+  const A = report.agents;
+  if (A) {
+    if (A.enabled === false) {
+      L.push('  agents      disabled (--no-agents)');
+    } else if (A.source) {
+      L.push(
+        `  agents      ${A.count} total · +${A.added.length} new · ~${A.updated.length} updated · ` +
+          `${A.unchanged.length} unchanged · -${A.removed.length} removed  ·  ${A.dir}`,
+      );
+      if (A.removed.length) L.push(`  agent rm    ${A.removed.join(', ')}`);
+      if (A.skipped.length) {
+        L.push(`  agent keep  ${A.skipped.length} foreign file(s): ${A.skipped.slice(0, 5).join(', ')}`);
+      }
+    } else {
+      L.push(`  agents      none synced — ${A.notes[0] || 'no source'}`);
+    }
+  }
   L.push(`  mode        ${report.mode}  ·  naming ${report.naming}  ·  fingerprint ${(report.fingerprint || '').slice(0, 16)}`);
   if (report.removed.length) L.push(`  removed     ${report.removed.join(', ')}`);
   if (report.skipped.length) L.push(`  kept        ${report.skipped.length} foreign file(s): ${report.skipped.slice(0, 5).join(', ')}`);
   for (const n of report.notes.slice(0, 12)) L.push(`  · ${n}`);
   if (report.notes.length > 12) L.push(`  · … ${report.notes.length - 12} more note(s)`);
   for (const w of report.warnings) L.push(`  ! ${w}`);
+  if (A) for (const n of A.notes.slice(0, 8)) L.push(`  · ${n}`);
+  if (A) for (const w of A.warnings) L.push(`  ! ${w}`);
   for (const e of report.errors) L.push(`  ✗ ${e}`);
+  if (A) for (const e of A.errors) L.push(`  ✗ ${e}`);
   if (report.changed && !report.dryRun && report.mode === 'reference') {
     L.push('  hint        pi expands these as native prompt templates — invoke one with /gsd-<command>');
+  }
+  if (A && A.count > 0 && !report.dryRun) {
+    L.push(
+      '  hint        pi-subagents picks the agents up on its next run; a session that is already open can use ' +
+        '/reload (or restart pi) to see them in {action:"list"}.',
+    );
   }
   return L.join('\n');
 }
@@ -1180,6 +2164,7 @@ const FLAG_SPEC = {
   '--mode': 'mode',
   '--naming': 'naming',
   '--out': 'outDir',
+  '--agents-out': 'agentsOut',
   '--source': 'source',
   '--max-inline-kb': 'maxInlineKb',
 };
@@ -1225,6 +2210,12 @@ function parseFlags(argv) {
       case '--reference':
         flags.mode = 'reference';
         break;
+      case '--agents':
+        flags.agents = true;
+        break;
+      case '--no-agents':
+        flags.noAgents = true;
+        break;
       case '--help':
       case '-h':
         flags.help = true;
@@ -1237,10 +2228,10 @@ function parseFlags(argv) {
   return flags;
 }
 
-const HELP = `gsd-slash-sync v${GENERATOR_VERSION} — GSD Core slash commands → pi prompt templates
+const HELP = `gsd-slash-sync v${GENERATOR_VERSION} — GSD Core commands + subagents → pi
 
 Usage:
-  node gsd-slash-sync.js sync [options]     regenerate the templates
+  node gsd-slash-sync.js sync [options]     regenerate the templates and agents
   node gsd-slash-sync.js status [--json]    show what is installed / whether it is stale
   node gsd-slash-sync.js install            copy this file into <agentDir>/extensions/
   node gsd-slash-sync.js help
@@ -1248,21 +2239,24 @@ Usage:
 Options:
   --mode <reference|inline>   reference (default, tiny templates) or inline (Claude-Code-equivalent)
   --naming <hyphen|colon>     /gsd-plan-phase (default, GSD's canonical pi form) or /gsd:plan-phase
-  --out <dir>                 output directory (default <agentDir>/gsd-commands)
+  --out <dir>                 command template directory (default <agentDir>/gsd-commands)
+  --agents-out <dir>          pi-subagents agent directory (default <agentDir>/agents)
+  --agents / --no-agents      convert GSD's subagents, or skip them (default: convert)
   --source <dir>              explicit directory holding the canonical commands/gsd/*.md
-  --max-inline-kb <n>         inline mode: fall back to reference above n KB per command (0 = no limit)
+  --max-inline-kb <n>         inline mode: fall back to reference above n KB per file (0 = no limit)
   --dry-run, -n               report what would change, write nothing
   --status                    print status instead of syncing
   --json                      machine-readable output
   --force, -f                 proceed even when the source looks broken
   --quiet, -q                 no output unless something changed or failed
-  --no-persist                do not write --mode/--naming/--source to the config file
+  --no-persist                do not write --mode/--naming/--source/--agents to the config file
 
 Environment: GSD_SLASH_SYNC_MODE, GSD_SLASH_SYNC_NAMING, GSD_SLASH_SYNC_OUT,
-             GSD_SLASH_SYNC_SOURCE, GSD_SLASH_SYNC_MAX_INLINE_KB,
-             GSD_SLASH_SYNC_AUTO=off, GSD_SLASH_SYNC_NOTIFY=off
+             GSD_SLASH_SYNC_AGENTS_OUT, GSD_SLASH_SYNC_NO_AGENTS, GSD_SLASH_SYNC_SOURCE,
+             GSD_SLASH_SYNC_MAX_INLINE_KB, GSD_SLASH_SYNC_AUTO=off, GSD_SLASH_SYNC_NOTIFY=off
 
-Inside pi: /gsd-sync [same flags]  ·  templates appear as /gsd-<command>
+Inside pi: /gsd-sync [same flags]  ·  commands appear as /gsd-<command>,
+           agents as gsd-<role> for pi-subagents (subagent({ agent: "gsd-planner", task: "…" }))
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1299,6 +2293,7 @@ const SYNC_FLAG_COMPLETIONS = [
   '--mode reference',
   '--naming hyphen',
   '--naming colon',
+  '--no-agents',
 ];
 
 /**
@@ -1339,14 +2334,19 @@ module.exports = function gsdSlashSyncExtension(pi) {
       const changed = report.ok && report.changed;
       if (opts.notify) {
         if (changed) {
+          const agentPart = report.agents && report.agents.count ? `, ${report.agents.count} subagents` : '';
           notify(
             ctx,
-            `GSD slash commands synced (${report.templates} templates, GSD Core ${report.version}): ` +
-              `+${report.added.length} ~${report.updated.length} -${report.removed.length}`,
+            `GSD synced for pi (${report.templates} commands${agentPart}, GSD Core ${report.version}): ` +
+              `+${report.added.length + report.agents.added.length} ~${report.updated.length + report.agents.updated.length}`,
             'info',
           );
         } else if (!report.ok) {
-          notify(ctx, `GSD slash sync failed: ${report.errors[0] || 'unknown error'}`, 'warning');
+          notify(
+            ctx,
+            `GSD slash sync failed: ${report.errors[0] || report.agents.errors[0] || 'unknown error'}`,
+            'warning',
+          );
         }
       }
     } catch (err) {
@@ -1399,14 +2399,16 @@ module.exports = function gsdSlashSyncExtension(pi) {
     name: 'gsd_slash_sync',
     label: 'GSD Slash Sync',
     description:
-      'Regenerate the /gsd-* slash command templates for pi from the installed GSD Core command definitions. ' +
-      'Run this after a GSD Core update so newly added/changed commands show up. Use action "status" to inspect.',
+      'Regenerate the /gsd-* slash command templates and the gsd-* pi-subagents agent definitions for pi from the ' +
+      'installed GSD Core sources. Run this after a GSD Core update so newly added/changed commands and agents show ' +
+      'up. Use action "status" to inspect.',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['sync', 'status'], description: 'sync (default) or status' },
         mode: { type: 'string', enum: ['reference', 'inline'], description: 'template mode override' },
         naming: { type: 'string', enum: ['hyphen', 'colon'], description: 'command naming override' },
+        agents: { type: 'boolean', description: 'convert GSD subagents too (default true)' },
         dryRun: { type: 'boolean', description: 'report planned changes without writing' },
         force: { type: 'boolean', description: 'proceed even if the source looks broken' },
       },
@@ -1414,12 +2416,23 @@ module.exports = function gsdSlashSyncExtension(pi) {
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
       const p = params && typeof params === 'object' ? params : {};
       const cwd = (ctx && ctx.cwd) || process.cwd();
+      // Only forward the agent switches when the caller actually set them —
+      // `agents: undefined` must stay "use the configured behaviour".
+      const agentFlags =
+        typeof p.agents === 'boolean' ? { agents: p.agents, noAgents: p.agents === false } : {};
       try {
         if (p.action === 'status') {
-          const info = status({ cwd, mode: p.mode, naming: p.naming });
+          const info = status({ cwd, mode: p.mode, naming: p.naming, ...agentFlags });
           return { content: [{ type: 'text', text: formatStatus(info) }] };
         }
-        const report = sync({ cwd, mode: p.mode, naming: p.naming, dryRun: !!p.dryRun, force: !!p.force });
+        const report = sync({
+          cwd,
+          mode: p.mode,
+          naming: p.naming,
+          ...agentFlags,
+          dryRun: !!p.dryRun,
+          force: !!p.force,
+        });
         return { content: [{ type: 'text', text: formatReport(report) }] };
       } catch (err) {
         return {
@@ -1505,13 +2518,22 @@ module.exports._internals = {
   GENERATOR,
   CONFIG_FILE,
   STATE_FILE,
+  AGENTS_STATE_FILE,
   MARKER_PREFIX,
+  MARKER_SCAN_BYTES,
   GENERATOR_VERSION,
+  MIN_SOURCE_COMMANDS,
+  MIN_SOURCE_AGENTS,
   DEFAULT_CONFIG,
   expandHome,
   resolveAgentDir,
   parseFrontmatter,
+  frontmatterList,
   buildFrontmatter,
+  buildAgentFrontmatter,
+  mapAgentTools,
+  mapAgentDisallowed,
+  mapAgentEffort,
   protectShellPositionals,
   normalizeRuntimePaths,
   rewriteRuntimeNotes,
@@ -1520,10 +2542,20 @@ module.exports._internals = {
   resolveCoreRef,
   inlineContext,
   convertCommand,
+  convertAgent,
+  agentRuntimeContract,
+  subagentDispatchBlock,
   discoverSource,
   sourceCandidates,
+  discoverAgentSource,
+  agentSourceCandidates,
+  scoreAgentSource,
+  computeFingerprint,
+  readState,
+  writeFileAtomic,
   resolveOptions,
   parseFlags,
+  runtimeContract,
   sync,
   status,
   formatReport,
