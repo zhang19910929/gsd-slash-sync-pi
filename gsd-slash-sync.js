@@ -158,6 +158,62 @@ function resolveAgentDir() {
   return path.join(HOME, '.pi', 'agent');
 }
 
+/**
+ * Tool names the host's installed extension packages actually register.
+ *
+ * Detection is package-name based, read from pi's `settings.json` package list
+ * and, when that list is an npm spec, from the resolved install under
+ * `<agentDir>/npm/node_modules`. A package that is declared but not yet
+ * installed contributes nothing, so discovery never promises a tool the host
+ * cannot provide.
+ *
+ * @param {string} agentDir pi's agent directory (`~/.pi/agent`).
+ * @returns {string[]} extension tool names, in declaration order, deduped.
+ */
+function detectHostExtensionTools(agentDir, packageSpecs) {
+  const specs = Array.isArray(packageSpecs) ? packageSpecs : readInstalledPackageSpecs(agentDir);
+  const out = [];
+  const seenPackages = new Set();
+  for (const spec of specs) {
+    const name = npmPackageName(spec);
+    if (!name || seenPackages.has(name)) continue;
+    const tools = HOST_EXTENSION_TOOLS[name];
+    if (!tools) continue;
+    if (!isPackageInstalled(agentDir, name)) continue;
+    seenPackages.add(name);
+    for (const tool of tools) if (!out.includes(tool)) out.push(tool);
+  }
+  return out;
+}
+
+/** pi spec (`npm:foo`, `foo@1.2.3`, `npm:@scope/bar`) → bare package name. */
+function npmPackageName(spec) {
+  const raw = String(spec == null ? '' : spec).trim();
+  if (!raw) return '';
+  const body = raw.startsWith('npm:') ? raw.slice(4) : raw;
+  if (!body || body.startsWith('.') || body.startsWith('/') || path.isAbsolute(body)) return '';
+  const at = body.lastIndexOf('@');
+  return at > 0 ? body.slice(0, at) : body;
+}
+
+/** True when the package resolves inside pi's own npm install tree. */
+function isPackageInstalled(agentDir, name) {
+  if (!agentDir) return false;
+  return isDir(path.join(agentDir, 'npm', 'node_modules', ...name.split('/')));
+}
+
+/** The `packages` array from pi's `settings.json`; `[]` when unreadable. */
+function readInstalledPackageSpecs(agentDir) {
+  if (!agentDir) return [];
+  try {
+    const raw = fs.readFileSync(path.join(agentDir, 'settings.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed && parsed.packages) ? parsed.packages : [];
+  } catch {
+    return [];
+  }
+}
+
 function sha256(text) {
   return crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 }
@@ -708,6 +764,26 @@ const AGENT_TOOL_MAP = Object.freeze({
   ls: 'ls',
 });
 
+/**
+ * Extension packages → the tool names they register at runtime.
+ *
+ * Corrects the assumption above. A generated `tools:` allowlist is *strict*:
+ * an extension tool whose name is absent from it never reaches the child, even
+ * though the child did load the extension. Background (async) children were the
+ * common case — they load ambient extensions, yet every extension tool stayed
+ * invisible unless its name was listed. Measured on this repo: across 19 GSD
+ * phase-5 subagent runs (845 bash calls, 0 codegraph calls), not one extension
+ * tool was ever invoked.
+ *
+ * Packages absent from the host contribute nothing, so an install without them
+ * keeps exactly the allowlist it had before.
+ */
+const HOST_EXTENSION_TOOLS = Object.freeze({
+  '@izhimu/pi-codegraph': ['codegraph_explore'],
+  '@ff-labs/pi-fff': ['ffgrep', 'fffind', 'fff-multi-grep'],
+  'pi-hashline-edit-pro': ['anchor_grep', 'replace', 'insert', 'undo_last_change'],
+});
+
 /** MCP server → human name for the fallback note written into the agent prompt. */
 const MCP_SERVER_LABELS = Object.freeze({
   'plugin_context7_context7': 'Context7',
@@ -731,7 +807,7 @@ const MCP_SERVER_LABELS = Object.freeze({
  *
  * @returns {{ tools: string[], caps: object }}
  */
-function mapAgentTools(data, lists) {
+function mapAgentTools(data, lists, extensionTools) {
   const caps = { nested: false, asks: false, skill: false, web: false, mcp: [], unknown: [], dropped: [] };
   const tools = [];
   const push = (tool) => {
@@ -777,6 +853,12 @@ function mapAgentTools(data, lists) {
   }
   caps.dropped = [...new Set(caps.dropped)];
   caps.unknown = [...new Set(caps.unknown)];
+  // Extension tools the host actually provides. A declared allowlist is strict,
+  // so without this every extension tool stays invisible to the child even
+  // though the child loaded the extension (measured: 0 uses in 19 runs).
+  // Adding them can never empty the allowlist, so the failure mode the map
+  // guards against — a list that filters down to nothing — cannot happen.
+  for (const tool of Array.isArray(extensionTools) ? extensionTools : []) push(tool);
   return { tools, caps };
 }
 
@@ -1358,7 +1440,7 @@ function agentRuntimeContract({ name, ctx, mode, refs }) {
 function convertAgent(raw, name, ctx) {
   const { data, body, lists } = parseFrontmatter(raw);
   const description = String(data.description || '').trim() || `GSD ${name} agent`;
-  const { tools, caps } = mapAgentTools(data, lists);
+  const { tools, caps } = mapAgentTools(data, lists, ctx.extensionTools);
   // Several agents dispatch or load skills without ever declaring the Claude
   // `Skill` tool (`gsd-debug-session-manager` maps a hint to a skill to invoke,
   // `gsd-intel-updater` walks project `skills/` directories). They still need pi's
@@ -1504,6 +1586,11 @@ function writeFileAtomic(target, content) {
 function syncAgents(opts, ctx, source, agentSource, report) {
   const out = report.agents;
   const statePath = path.join(opts.agentsOut, AGENTS_STATE_FILE);
+  // Detected once per run so every generated allowlist carries the same set;
+  // an install without these packages yields `[]` and no allowlist changes.
+  const extensionTools = detectHostExtensionTools(opts.agentDir);
+  const agentCtx = extensionTools.length > 0 ? { ...ctx, extensionTools } : ctx;
+  if (extensionTools.length > 0) out.extensionTools = extensionTools;
 
   if (path.resolve(opts.agentsOut) === path.resolve(opts.outDir)) {
     out.errors.push(
@@ -1528,6 +1615,10 @@ function syncAgents(opts, ctx, source, agentSource, report) {
     mode: opts.mode,
     maxInlineKb: opts.maxInlineKb,
     source: agentSource.dir,
+    // Installing or removing an extension changes every generated allowlist, so
+    // it must change the fingerprint too — otherwise a sync would report "no
+    // changes" while the on-disk allowlists are stale.
+    extensionTools,
     coreRoot: ctx.coreRoot,
     version: ctx.version,
     agents: [],
@@ -1542,7 +1633,7 @@ function syncAgents(opts, ctx, source, agentSource, report) {
     }
     fingerprintParts.agents.push([name, sha256(raw)]);
     try {
-      const converted = convertAgent(raw, name, { ...ctx, srcDir: agentSource.dir });
+      const converted = convertAgent(raw, name, { ...agentCtx, srcDir: agentSource.dir });
       outputs.push({ outName: `${name}.md`, name, content: converted.content, info: converted });
     } catch (err) {
       out.errors.push(`convert ${name}: ${err && err.message ? err.message : String(err)}`);
@@ -2045,6 +2136,9 @@ function status(flags = {}) {
         mode: opts.mode,
         maxInlineKb: opts.maxInlineKb,
         source: agentSource.dir,
+        // Must match syncAgents' fingerprint exactly, or every status call
+        // would report STALE on a host with extensions installed.
+        extensionTools: detectHostExtensionTools(opts.agentDir),
         coreRoot: source.coreRoot || path.resolve(source.dir, '..', '..'),
         version: source.version,
         agents: agentParts,
@@ -2538,6 +2632,9 @@ module.exports._internals = {
   normalizeRuntimePaths,
   rewriteRuntimeNotes,
   buildColonPattern,
+  detectHostExtensionTools,
+  npmPackageName,
+  isPackageInstalled,
   normalizeColonCommands,
   resolveCoreRef,
   inlineContext,

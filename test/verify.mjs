@@ -41,6 +41,13 @@ const agentDir = flag('--agent-dir', _internals.resolveAgentDir());
 const keep = argv.includes('--keep');
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-slash-sync-verify-'));
 
+// Extension tools the host's installed packages contribute to every generated
+// allowlist. Expected values are derived from the same detection the generator
+// uses, so the suite stays honest on a host without these packages (where the
+// extras are `[]` and the assertions below are exactly the pre-detection ones).
+const extensionTools = _internals.detectHostExtensionTools(agentDir);
+const withExtras = (base) => [...base.split(','), ...extensionTools].sort().join(',');
+
 // pi-subagents' user agent directory. Every sync/status call below redirects the
 // agent output into the temp root: writing GSD's 35 agent definitions into the
 // real directory from a test run is exactly the kind of side effect this suite
@@ -348,19 +355,19 @@ const toolsOf = (file) => {
   const line = /^tools: (.*)$/m.exec(fmOf(file));
   return line ? line[1].split(',').map((s) => s.trim()).sort() : [];
 };
-check('gsd-planner tools mapped to pi builtins', toolsOf('gsd-planner.md').join(',') === 'bash,edit,find,grep,read,write', toolsOf('gsd-planner.md').join(','));
+check('gsd-planner tools mapped to pi builtins', toolsOf('gsd-planner.md').join(',') === withExtras('bash,edit,find,grep,read,write'), toolsOf('gsd-planner.md').join(','));
 check('GSD effort became pi thinking', /^thinking: xhigh$/m.test(fmOf('gsd-planner.md')));
 check('a low-effort agent keeps its lower level', /^thinking: low$/m.test(fmOf('gsd-codebase-mapper.md')));
 check(
   'the YAML block-list form of tools: is read (gsd-security-auditor)',
-  toolsOf('gsd-security-auditor.md').join(',') === 'bash,find,grep,read',
+  toolsOf('gsd-security-auditor.md').join(',') === withExtras('bash,find,grep,read'),
   toolsOf('gsd-security-auditor.md').join(','),
 );
 check('Claude-only tool names never reach the frontmatter', !/^(tools|excludeTools): .*\b(Glob|Skill|WebFetch|WebSearch|AskUserQuestion|Agent)\b/m.test(fmOf('gsd-planner.md')));
 check('no mcp selector is emitted (an unresolvable one aborts the spawn)', !/mcp:/.test(agentSources.get('gsd-planner.md')));
 check('no Claude color/effort keys survive', !/^(color|effort):/m.test(fmOf('gsd-planner.md')));
 check('disallowedTools became excludeTools', /^excludeTools: edit$/m.test(fmOf('gsd-verifier.md')));
-const knownTools = new Set(['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'subagent', 'contact_supervisor']);
+const knownTools = new Set(['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'subagent', 'contact_supervisor', ...extensionTools]);
 check(
   'every allowlist is non-empty and uses only pi tool names',
   agentFiles.every((f) => {
@@ -377,6 +384,35 @@ check(
 );
 check('ordinary agents are not authorised to fan out', !/^allowNestedSubagents:/m.test(fmOf('gsd-planner.md')));
 check('AskUserQuestion maps to contact_supervisor', /^tools: .*\bcontact_supervisor\b/m.test(fmOf('gsd-eval-planner.md')));
+// ── extension tools ────────────────────────────────────────────────────────
+// A declared allowlist is strict: an extension tool whose name is absent never
+// reaches the child, even though the child loaded the extension. The generator
+// therefore merges in the tools the host's installed packages provide.
+const hostTools = _internals.detectHostExtensionTools(agentDir);
+check(
+  'extension tools the host provides are merged into every allowlist',
+  agentFiles.every((f) => hostTools.every((t) => toolsOf(f).includes(t))),
+  `hostTools=${hostTools.join(',') || '(none)'}`,
+);
+check(
+  'a host without the extension packages adds nothing',
+  _internals.detectHostExtensionTools(path.join(tmpRoot, 'no-such-agent-dir')).length === 0,
+);
+check(
+  'a declared-but-uninstalled package contributes no tool',
+  // The package is named in `packages`, but nothing is installed under the
+  // given agent dir, so detection must not promise its tools.
+  _internals.detectHostExtensionTools(path.join(tmpRoot, 'no-such-agent-dir'), ['npm:@izhimu/pi-codegraph']).length === 0 &&
+  // A package the plugin does not know about contributes nothing either.
+  _internals.detectHostExtensionTools(agentDir, ['npm:pi-powerline-footer', 'npm:pi-mcp-adapter']).length === 0,
+);
+check(
+  'pi spec parsing handles scopes, versions and local paths',
+  _internals.npmPackageName('npm:@scope/pkg') === '@scope/pkg' &&
+    _internals.npmPackageName('npm:pkg@1.2.3') === 'pkg' &&
+    _internals.npmPackageName('./local') === '' &&
+    _internals.npmPackageName('') === '',
+);
 check('Skill declaring agents inherit the pi skills catalogue', /^inheritSkills: true$/m.test(fmOf('gsd-planner.md')));
 check('agents without Skill do not', !/^inheritSkills:/m.test(fmOf('gsd-user-profiler.md')));
 check('every agent keeps repository instructions', agentFiles.every((f) => /^inheritProjectContext: true$/m.test(fmOf(f))));
@@ -544,7 +580,7 @@ if (fs.existsSync(jitiPath) && fs.existsSync(piSubagentsDir)) {
       `generated=${generated.length} discovered=${discovered.size} missing=${generated.filter((n) => !discovered.has(n)).join(', ')}`,
     );
     const planner = ours.find((a) => a.name === 'gsd-planner');
-    check('pi-subagents reads the mapped tool allowlist', planner && planner.tools.join(',') === 'read,write,edit,bash,find,grep', planner && planner.tools.join(','));
+    check('pi-subagents reads the mapped tool allowlist', planner && planner.tools.join(',') === ['read', 'write', 'edit', 'bash', 'find', 'grep', ...extensionTools].join(','), planner && planner.tools.join(','));
     check('pi-subagents reads the thinking level', planner && planner.thinking === 'xhigh', planner && String(planner.thinking));
     check('pi-subagents reads the excludeTools mapping', (ours.find((a) => a.name === 'gsd-verifier') || {}).excludeTools?.join(',') === 'edit');
     const manager = ours.find((a) => a.name === 'gsd-debug-session-manager');

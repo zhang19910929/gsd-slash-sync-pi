@@ -127,6 +127,37 @@ prompt what to use instead:
 Nothing above is required to *use* the agents: an agent with no web access still runs, it just reports that a
 lookup was unavailable. Only **pi-subagents** is a hard prerequisite for the agent half.
 
+### 2.2.1 Extension tools are merged into every generated allowlist
+
+A generated `tools:` line is a **strict allowlist**, not a hint. pi-subagents filters the child's tool
+registry down to the names it lists, and extension tools are filtered exactly like builtins — so an extension
+tool that is not named never reaches the child *even though the child did load the extension*. Background
+(`async`) children are the common case: they load ambient extensions, yet every extension tool stayed
+invisible because the generated allowlist only named pi builtins.
+
+The generator therefore detects the host's installed extension packages and appends the tools they register to
+every generated allowlist:
+
+| Package | Tools merged in |
+| --- | --- |
+| `@izhimu/pi-codegraph` | `codegraph_explore` |
+| `@ff-labs/pi-fff` | `ffgrep`, `fffind`, `fff-multi-grep` |
+| `pi-hashline-edit-pro` | `anchor_grep`, `replace`, `insert`, `undo_last_change` |
+
+Detection reads `packages` from `~/.pi/agent/settings.json` and confirms the package resolves under
+`~/.pi/agent/npm/node_modules`. **A package that is declared but not installed contributes nothing**, and a
+host with none of these packages generates exactly the allowlist it did before — the merge only ever adds, so
+it can never filter a list down to nothing. The detected set is part of the agent fingerprint, so installing
+or removing an extension makes the next `status` report stale and the next `sync` rewrite the allowlists.
+
+Two consequences worth knowing:
+
+- **`pi-hashline-edit-pro` removes `edit` itself.** It is merged in alongside `edit` because the allowlist is
+  the union of what the agent declared and what the host provides; the extension drops the builtin at session
+  start on its own. Annotated edits (`replace` / `insert`) are available either way.
+- **Extension tools are only half the story.** Naming them is necessary but not sufficient: the child must
+  also be a background child so the extensions actually load. See the note above about `async: false`.
+
 ### 2.3 Where the source definitions come from (and which one to install)
 
 The plugin never ships GSD's commands or agents itself — it converts a GSD Core copy that is already on disk.
