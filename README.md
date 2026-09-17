@@ -133,10 +133,11 @@ A generated `tools:` line is a **strict allowlist**, not a hint. pi-subagents fi
 registry down to the names it lists, and extension tools are filtered exactly like builtins — so an extension
 tool that is not named never reaches the child *even though the child did load the extension*. Background
 (`async`) children are the common case: they load ambient extensions, yet every extension tool stayed
-invisible because the generated allowlist only named pi builtins.
+invisible because the generated allowlist only named pi builtins. Measured before the fix: across 19 GSD
+subagent runs (845 `bash` calls) not one extension tool was ever invoked.
 
-The generator therefore detects the host's installed extension packages and appends the tools they register to
-every generated allowlist:
+The generator therefore checks pi's own `settings.json` (`packages`) and confirms each package resolves under
+`<agentDir>/npm/node_modules`, then appends the tools it registers:
 
 | Package | Tools merged in |
 | --- | --- |
@@ -144,19 +145,33 @@ every generated allowlist:
 | `@ff-labs/pi-fff` | `ffgrep`, `fffind`, `fff-multi-grep` |
 | `pi-hashline-edit-pro` | `anchor_grep`, `replace`, `insert`, `undo_last_change` |
 
-Detection reads `packages` from `~/.pi/agent/settings.json` and confirms the package resolves under
-`~/.pi/agent/npm/node_modules`. **A package that is declared but not installed contributes nothing**, and a
-host with none of these packages generates exactly the allowlist it did before — the merge only ever adds, so
-it can never filter a list down to nothing. The detected set is part of the agent fingerprint, so installing
-or removing an extension makes the next `status` report stale and the next `sync` rewrite the allowlists.
+Detection is by installed package, so an install without them keeps exactly the allowlist it had before —
+**nothing is added unless the host can actually provide it**. Installing or removing one of these packages
+changes the agent fingerprint, so the next sync re-runs instead of reporting "no changes".
 
-Two consequences worth knowing:
+### 2.2.2 Web tools go only to research agents
 
-- **`pi-hashline-edit-pro` removes `edit` itself.** It is merged in alongside `edit` because the allowlist is
-  the union of what the agent declared and what the host provides; the extension drops the builtin at session
-  start on its own. Annotated edits (`replace` / `insert`) are available either way.
-- **Extension tools are only half the story.** Naming them is necessary but not sufficient: the child must
-  also be a background child so the extensions actually load. See the note above about `async: false`.
+`WebSearch` / `WebFetch` in a GSD agent definition used to set a `caps.web` flag that only decorated the
+generated prompt: the child was told to use `web_search`, but the name was never in its allowlist, so the
+advice pointed at a tool it could not call. When `pi-web-access` is installed the four tools
+(`web_search`, `source_check`, `fetch_content`, `get_search_content`) are now added — but **only to research
+roles**, because the grant is network reach, not just another lookup helper:
+
+- **Granted** to names matching `*-researcher` / `*-synthesizer` that also declared a web tool:
+  `gsd-phase-researcher`, `gsd-project-researcher`, `gsd-ui-researcher`, `gsd-domain-researcher`,
+  `gsd-ai-researcher`, `gsd-advisor-researcher`.
+- **Withheld** from `gsd-executor`, `gsd-planner`, `gsd-debugger` and `gsd-framework-selector` even though
+  they name a web tool in their frontmatter or prose. A planner does not need outbound access to write a plan,
+  and an executor should not have network reach it never asked to use.
+
+**Explicitly not merged in**, because they widen a child's *behaviour* rather than its toolkit — a child that
+can start background jobs or fan out into more subagents is a different thing from one that can look up a
+symbol: `bg_*` / `fusion_*` (`pi-background-tasks`), `subagent` / `contact_supervisor` (only for agents GSD
+marks as nested-capable), and `pi-autoresearch`'s `init_experiment` / `run_experiment` / `log_experiment`.
+
+**Skills need no equivalent change.** GSD's `Skill` tool maps to pi-subagents' `inheritSkills`, which is
+already emitted for every agent that GSD gives `Skill` to; those children read the skill's `SKILL.md`
+directly (project skills live in `.pi/skills/` and `.agents/skills/`).
 
 ### 2.3 Where the source definitions come from (and which one to install)
 

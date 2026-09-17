@@ -186,6 +186,21 @@ function detectHostExtensionTools(agentDir, packageSpecs) {
   return out;
 }
 
+/**
+* True when the host installs `pi-web-access`, so the web tool names resolve.
+*
+* Detection mirrors `detectHostExtensionTools`; the tools themselves are only
+* appended to agents that declared `WebSearch` / `WebFetch`.
+* @param {string} agentDir pi's agent directory (`~/.pi/agent`).
+* @param {string[]} [packageSpecs] override for tests.
+* @returns {boolean}
+*/
+function hostProvidesWebTools(agentDir, packageSpecs) {
+  const specs = Array.isArray(packageSpecs) ? packageSpecs : readInstalledPackageSpecs(agentDir);
+  const declared = specs.some((spec) => npmPackageName(spec) === WEB_EXTENSION_PACKAGE);
+  return declared && isPackageInstalled(agentDir, WEB_EXTENSION_PACKAGE);
+}
+
 /** pi spec (`npm:foo`, `foo@1.2.3`, `npm:@scope/bar`) → bare package name. */
 function npmPackageName(spec) {
   const raw = String(spec == null ? '' : spec).trim();
@@ -784,6 +799,24 @@ const HOST_EXTENSION_TOOLS = Object.freeze({
   'pi-hashline-edit-pro': ['anchor_grep', 'replace', 'insert', 'undo_last_change'],
 });
 
+/**
+ * Web tools contributed by `pi-web-access`, restricted to GSD's research agents.
+ *
+ * Two gates apply. The agent must have declared `WebSearch` / `WebFetch` (which
+ * sets `caps.web`), and its name must look like a research role — so the
+ * researchers and synthesizers that exist to look things up get network reach,
+ * while a planner, debugger or framework selector that merely names a web tool
+ * in passing stays off the network. Executors never qualify.
+ *
+ * The prompt already tells these children to use pi's equivalents; without this
+ * the names never reached the allowlist and the advice pointed at tools the
+ * child could not call.
+ */
+const WEB_EXTENSION_PACKAGE = 'pi-web-access';
+const WEB_TOOL_NAMES = Object.freeze(['web_search', 'source_check', 'fetch_content', 'get_search_content']);
+/** Research roles that may reach the network. Matches the generated agent names. */
+const RESEARCH_AGENT_PATTERN = /(?:^|-)researcher$|(?:^|-)synthesizer$/;
+
 /** MCP server → human name for the fallback note written into the agent prompt. */
 const MCP_SERVER_LABELS = Object.freeze({
   'plugin_context7_context7': 'Context7',
@@ -807,7 +840,7 @@ const MCP_SERVER_LABELS = Object.freeze({
  *
  * @returns {{ tools: string[], caps: object }}
  */
-function mapAgentTools(data, lists, extensionTools) {
+function mapAgentTools(data, lists, extensionTools, webToolsAvailable, agentName) {
   const caps = { nested: false, asks: false, skill: false, web: false, mcp: [], unknown: [], dropped: [] };
   const tools = [];
   const push = (tool) => {
@@ -859,6 +892,13 @@ function mapAgentTools(data, lists, extensionTools) {
   // Adding them can never empty the allowlist, so the failure mode the map
   // guards against — a list that filters down to nothing — cannot happen.
   for (const tool of Array.isArray(extensionTools) ? extensionTools : []) push(tool);
+  // Web tools are gated on the agent's own declaration. GSD names `WebSearch` /
+  // `WebFetch`, which set `caps.web`; only those agents get network reach.
+  // Network reach is limited to research roles: a planner or framework selector
+  // that merely names `WebSearch` in passing must not gain outbound access.
+  if (caps.web && webToolsAvailable && RESEARCH_AGENT_PATTERN.test(String(agentName || ''))) {
+    for (const tool of WEB_TOOL_NAMES) push(tool);
+  }
   return { tools, caps };
 }
 
@@ -1440,7 +1480,7 @@ function agentRuntimeContract({ name, ctx, mode, refs }) {
 function convertAgent(raw, name, ctx) {
   const { data, body, lists } = parseFrontmatter(raw);
   const description = String(data.description || '').trim() || `GSD ${name} agent`;
-  const { tools, caps } = mapAgentTools(data, lists, ctx.extensionTools);
+  const { tools, caps } = mapAgentTools(data, lists, ctx.extensionTools, ctx.webToolsAvailable, name);
   // Several agents dispatch or load skills without ever declaring the Claude
   // `Skill` tool (`gsd-debug-session-manager` maps a hint to a skill to invoke,
   // `gsd-intel-updater` walks project `skills/` directories). They still need pi's
@@ -1589,8 +1629,10 @@ function syncAgents(opts, ctx, source, agentSource, report) {
   // Detected once per run so every generated allowlist carries the same set;
   // an install without these packages yields `[]` and no allowlist changes.
   const extensionTools = detectHostExtensionTools(opts.agentDir);
-  const agentCtx = extensionTools.length > 0 ? { ...ctx, extensionTools } : ctx;
+  const webToolsAvailable = hostProvidesWebTools(opts.agentDir);
+  const agentCtx = { ...ctx, extensionTools, webToolsAvailable };
   if (extensionTools.length > 0) out.extensionTools = extensionTools;
+  if (webToolsAvailable) out.webTools = WEB_TOOL_NAMES;
 
   if (path.resolve(opts.agentsOut) === path.resolve(opts.outDir)) {
     out.errors.push(
@@ -1619,6 +1661,7 @@ function syncAgents(opts, ctx, source, agentSource, report) {
     // it must change the fingerprint too — otherwise a sync would report "no
     // changes" while the on-disk allowlists are stale.
     extensionTools,
+    webToolsAvailable,
     coreRoot: ctx.coreRoot,
     version: ctx.version,
     agents: [],
@@ -2139,6 +2182,7 @@ function status(flags = {}) {
         // Must match syncAgents' fingerprint exactly, or every status call
         // would report STALE on a host with extensions installed.
         extensionTools: detectHostExtensionTools(opts.agentDir),
+        webToolsAvailable: hostProvidesWebTools(opts.agentDir),
         coreRoot: source.coreRoot || path.resolve(source.dir, '..', '..'),
         version: source.version,
         agents: agentParts,
@@ -2633,6 +2677,9 @@ module.exports._internals = {
   rewriteRuntimeNotes,
   buildColonPattern,
   detectHostExtensionTools,
+  hostProvidesWebTools,
+  WEB_TOOL_NAMES,
+  RESEARCH_AGENT_PATTERN,
   npmPackageName,
   isPackageInstalled,
   normalizeColonCommands,

@@ -367,7 +367,7 @@ check('Claude-only tool names never reach the frontmatter', !/^(tools|excludeToo
 check('no mcp selector is emitted (an unresolvable one aborts the spawn)', !/mcp:/.test(agentSources.get('gsd-planner.md')));
 check('no Claude color/effort keys survive', !/^(color|effort):/m.test(fmOf('gsd-planner.md')));
 check('disallowedTools became excludeTools', /^excludeTools: edit$/m.test(fmOf('gsd-verifier.md')));
-const knownTools = new Set(['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'subagent', 'contact_supervisor', ...extensionTools]);
+const knownTools = new Set(['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'subagent', 'contact_supervisor', ...extensionTools, ..._internals.WEB_TOOL_NAMES]);
 check(
   'every allowlist is non-empty and uses only pi tool names',
   agentFiles.every((f) => {
@@ -405,6 +405,40 @@ check(
   _internals.detectHostExtensionTools(path.join(tmpRoot, 'no-such-agent-dir'), ['npm:@izhimu/pi-codegraph']).length === 0 &&
   // A package the plugin does not know about contributes nothing either.
   _internals.detectHostExtensionTools(agentDir, ['npm:pi-powerline-footer', 'npm:pi-mcp-adapter']).length === 0,
+);
+// Web tools are a narrower grant: only research roles that declared
+// `WebSearch` / `WebFetch` may reach the network, so an executor or planner that
+// merely names a web tool in its prose never gains outbound access.
+const webToolNames = [..._internals.WEB_TOOL_NAMES];
+const hasWeb = (file) => webToolNames.every((t) => toolsOf(file).includes(t));
+const noWeb = (file) => webToolNames.every((t) => !toolsOf(file).includes(t));
+const webAvailable = _internals.hostProvidesWebTools(agentDir);
+if (webAvailable) {
+  check(
+    'research agents receive the web tools',
+    ['gsd-phase-researcher.md', 'gsd-project-researcher.md', 'gsd-ui-researcher.md', 'gsd-domain-researcher.md', 'gsd-ai-researcher.md', 'gsd-advisor-researcher.md'].every(
+      (f) => hasWeb(f),
+    ),
+    agentFiles.filter((f) => f.includes('researcher') && !hasWeb(f)).join(', '),
+  );
+  check(
+    'non-research agents stay off the network',
+    ['gsd-executor.md', 'gsd-planner.md', 'gsd-debugger.md', 'gsd-framework-selector.md'].every((f) => noWeb(f)),
+    ['gsd-executor.md', 'gsd-planner.md', 'gsd-debugger.md', 'gsd-framework-selector.md'].filter((f) => !noWeb(f)).join(', '),
+  );
+  check(
+    'web tools are gated on the research-role pattern, not on declaring WebSearch alone',
+    _internals.RESEARCH_AGENT_PATTERN.test('gsd-phase-researcher') &&
+      _internals.RESEARCH_AGENT_PATTERN.test('gsd-research-synthesizer') &&
+      !_internals.RESEARCH_AGENT_PATTERN.test('gsd-planner') &&
+      !_internals.RESEARCH_AGENT_PATTERN.test('gsd-executor'),
+  );
+} else {
+  check('host without pi-web-access grants no web tools', agentFiles.every((f) => noWeb(f)));
+}
+check(
+  'a host without pi-web-access reports no web tools',
+  _internals.hostProvidesWebTools(path.join(tmpRoot, 'no-such-agent-dir')) === false,
 );
 check(
   'pi spec parsing handles scopes, versions and local paths',
