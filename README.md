@@ -128,7 +128,6 @@ Nothing above is required to *use* the agents: an agent with no web access still
 lookup was unavailable. Only **pi-subagents** is a hard prerequisite for the agent half.
 
 ### 2.2.1 Extension tools are merged into every generated allowlist
-
 A generated `tools:` line is a **strict allowlist**, not a hint. pi-subagents filters the child's tool
 registry down to the names it lists, and extension tools are filtered exactly like builtins — so an extension
 tool that is not named never reaches the child *even though the child did load the extension*. Background
@@ -136,42 +135,30 @@ tool that is not named never reaches the child *even though the child did load t
 invisible because the generated allowlist only named pi builtins. Measured before the fix: across 19 GSD
 subagent runs (845 `bash` calls) not one extension tool was ever invoked.
 
-The generator therefore checks pi's own `settings.json` (`packages`) and confirms each package resolves under
-`<agentDir>/npm/node_modules`, then appends the tools it registers:
+The division of labor is **allowlist = existence, prompt = selection**. GSD's own agent text already tells
+each child which lookups its job needs (research agents are told to search the web, the executor is told to
+read code); the allowlist only decides whether a tool exists for the child to pick up. The generator
+therefore checks pi's own `settings.json` (`packages`), confirms each package actually resolves under
+`<agentDir>/npm/node_modules`, and merges what it finds into every allowlist:
 
-| Package | Tools merged in |
-| --- | --- |
+| package | tools merged in |
+|---|---|
 | `@izhimu/pi-codegraph` | `codegraph_explore` |
 | `@ff-labs/pi-fff` | `ffgrep`, `fffind`, `fff-multi-grep` |
 | `pi-hashline-edit-pro` | `anchor_grep`, `replace`, `insert`, `undo_last_change` |
+| `pi-web-access` | `web_search`, `source_check`, `fetch_content`, `get_search_content` |
 
-Detection is by installed package, so an install without them keeps exactly the allowlist it had before —
-**nothing is added unless the host can actually provide it**. Installing or removing one of these packages
-changes the agent fingerprint, so the next sync re-runs instead of reporting "no changes".
+A package that is absent contributes nothing, so an install without these extensions keeps exactly the
+allowlist it had before.
 
-### 2.2.2 Web tools go only to research agents
+**Deliberately excluded** — tools that change the child's behavior rather than its reach:
+`bg_*` / `fusion_*` (`pi-background-tasks`), `subagent` / `contact_supervisor` (only for agents GSD marks as
+nested-capable), and `pi-autoresearch`'s `init_experiment` / `run_experiment` / `log_experiment`.
 
-`WebSearch` / `WebFetch` in a GSD agent definition used to set a `caps.web` flag that only decorated the
-generated prompt: the child was told to use `web_search`, but the name was never in its allowlist, so the
-advice pointed at a tool it could not call. When `pi-web-access` is installed the four tools
-(`web_search`, `source_check`, `fetch_content`, `get_search_content`) are now added — but **only to research
-roles**, because the grant is network reach, not just another lookup helper:
-
-- **Granted** to names matching `*-researcher` / `*-synthesizer` that also declared a web tool:
-  `gsd-phase-researcher`, `gsd-project-researcher`, `gsd-ui-researcher`, `gsd-domain-researcher`,
-  `gsd-ai-researcher`, `gsd-advisor-researcher`.
-- **Withheld** from `gsd-executor`, `gsd-planner`, `gsd-debugger` and `gsd-framework-selector` even though
-  they name a web tool in their frontmatter or prose. A planner does not need outbound access to write a plan,
-  and an executor should not have network reach it never asked to use.
-
-**Explicitly not merged in**, because they widen a child's *behaviour* rather than its toolkit — a child that
-can start background jobs or fan out into more subagents is a different thing from one that can look up a
-symbol: `bg_*` / `fusion_*` (`pi-background-tasks`), `subagent` / `contact_supervisor` (only for agents GSD
-marks as nested-capable), and `pi-autoresearch`'s `init_experiment` / `run_experiment` / `log_experiment`.
-
-**Skills need no equivalent change.** GSD's `Skill` tool maps to pi-subagents' `inheritSkills`, which is
-already emitted for every agent that GSD gives `Skill` to; those children read the skill's `SKILL.md`
-directly (project skills live in `.pi/skills/` and `.agents/skills/`).
+**Skills need no equivalent change.** Skills are not tool-registry entries at all — pi formats them into the
+child's system prompt (`noSkills = !inheritSkills`), so they were never blocked by the allowlist. GSD's
+`Skill` tool maps to `inheritSkills`, already emitted for every agent that GSD gives `Skill` to; those
+children read the skill's `SKILL.md` directly (project skills live in `.pi/skills/` and `.agents/skills/`).
 
 ### 2.3 Where the source definitions come from (and which one to install)
 

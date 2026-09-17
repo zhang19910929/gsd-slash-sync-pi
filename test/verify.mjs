@@ -46,7 +46,8 @@ const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-slash-sync-verify-'))
 // uses, so the suite stays honest on a host without these packages (where the
 // extras are `[]` and the assertions below are exactly the pre-detection ones).
 const extensionTools = _internals.detectHostExtensionTools(agentDir);
-const withExtras = (base) => [...base.split(','), ...extensionTools].sort().join(',');
+const webTools = _internals.hostProvidesWebTools(agentDir);
+const withExtras = (base) => [...base.split(','), ...extensionTools, ...(webTools ? _internals.WEB_TOOL_NAMES : [])].sort().join(',');
 
 // pi-subagents' user agent directory. Every sync/status call below redirects the
 // agent output into the temp root: writing GSD's 35 agent definitions into the
@@ -406,32 +407,18 @@ check(
   // A package the plugin does not know about contributes nothing either.
   _internals.detectHostExtensionTools(agentDir, ['npm:pi-powerline-footer', 'npm:pi-mcp-adapter']).length === 0,
 );
-// Web tools are a narrower grant: only research roles that declared
-// `WebSearch` / `WebFetch` may reach the network, so an executor or planner that
-// merely names a web tool in its prose never gains outbound access.
+// Web tools go to every agent when the host provides them. The prompt is the
+// selector — GSD's own text tells each child which lookups its job needs — so
+// the allowlist only decides whether the tool exists, not when it is used.
 const webToolNames = [..._internals.WEB_TOOL_NAMES];
 const hasWeb = (file) => webToolNames.every((t) => toolsOf(file).includes(t));
 const noWeb = (file) => webToolNames.every((t) => !toolsOf(file).includes(t));
 const webAvailable = _internals.hostProvidesWebTools(agentDir);
 if (webAvailable) {
   check(
-    'research agents receive the web tools',
-    ['gsd-phase-researcher.md', 'gsd-project-researcher.md', 'gsd-ui-researcher.md', 'gsd-domain-researcher.md', 'gsd-ai-researcher.md', 'gsd-advisor-researcher.md'].every(
-      (f) => hasWeb(f),
-    ),
-    agentFiles.filter((f) => f.includes('researcher') && !hasWeb(f)).join(', '),
-  );
-  check(
-    'non-research agents stay off the network',
-    ['gsd-executor.md', 'gsd-planner.md', 'gsd-debugger.md', 'gsd-framework-selector.md'].every((f) => noWeb(f)),
-    ['gsd-executor.md', 'gsd-planner.md', 'gsd-debugger.md', 'gsd-framework-selector.md'].filter((f) => !noWeb(f)).join(', '),
-  );
-  check(
-    'web tools are gated on the research-role pattern, not on declaring WebSearch alone',
-    _internals.RESEARCH_AGENT_PATTERN.test('gsd-phase-researcher') &&
-      _internals.RESEARCH_AGENT_PATTERN.test('gsd-research-synthesizer') &&
-      !_internals.RESEARCH_AGENT_PATTERN.test('gsd-planner') &&
-      !_internals.RESEARCH_AGENT_PATTERN.test('gsd-executor'),
+    'every agent receives the web tools',
+    agentFiles.every((f) => hasWeb(f)),
+    agentFiles.filter((f) => !hasWeb(f)).join(', '),
   );
 } else {
   check('host without pi-web-access grants no web tools', agentFiles.every((f) => noWeb(f)));
@@ -614,7 +601,7 @@ if (fs.existsSync(jitiPath) && fs.existsSync(piSubagentsDir)) {
       `generated=${generated.length} discovered=${discovered.size} missing=${generated.filter((n) => !discovered.has(n)).join(', ')}`,
     );
     const planner = ours.find((a) => a.name === 'gsd-planner');
-    check('pi-subagents reads the mapped tool allowlist', planner && planner.tools.join(',') === ['read', 'write', 'edit', 'bash', 'find', 'grep', ...extensionTools].join(','), planner && planner.tools.join(','));
+    check('pi-subagents reads the mapped tool allowlist', planner && planner.tools.join(',') === ['read', 'write', 'edit', 'bash', 'find', 'grep', ...extensionTools, ...(webTools ? _internals.WEB_TOOL_NAMES : [])].join(','), planner && planner.tools.join(','));
     check('pi-subagents reads the thinking level', planner && planner.thinking === 'xhigh', planner && String(planner.thinking));
     check('pi-subagents reads the excludeTools mapping', (ours.find((a) => a.name === 'gsd-verifier') || {}).excludeTools?.join(',') === 'edit');
     const manager = ours.find((a) => a.name === 'gsd-debug-session-manager');

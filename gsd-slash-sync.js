@@ -840,7 +840,7 @@ const MCP_SERVER_LABELS = Object.freeze({
  *
  * @returns {{ tools: string[], caps: object }}
  */
-function mapAgentTools(data, lists, extensionTools, webToolsAvailable, agentName) {
+function mapAgentTools(data, lists, extensionTools, webToolsAvailable) {
   const caps = { nested: false, asks: false, skill: false, web: false, mcp: [], unknown: [], dropped: [] };
   const tools = [];
   const push = (tool) => {
@@ -892,13 +892,10 @@ function mapAgentTools(data, lists, extensionTools, webToolsAvailable, agentName
   // Adding them can never empty the allowlist, so the failure mode the map
   // guards against — a list that filters down to nothing — cannot happen.
   for (const tool of Array.isArray(extensionTools) ? extensionTools : []) push(tool);
-  // Web tools are gated on the agent's own declaration. GSD names `WebSearch` /
-  // `WebFetch`, which set `caps.web`; only those agents get network reach.
-  // Network reach is limited to research roles: a planner or framework selector
-  // that merely names `WebSearch` in passing must not gain outbound access.
-  if (caps.web && webToolsAvailable && RESEARCH_AGENT_PATTERN.test(String(agentName || ''))) {
-    for (const tool of WEB_TOOL_NAMES) push(tool);
-  }
+  // Web tools go to every agent when the host provides them. The prompt is the
+  // selector — GSD's own text tells each child which lookups its job needs — so
+  // the allowlist only decides whether the tool exists, not when it is used.
+  if (webToolsAvailable) for (const tool of WEB_TOOL_NAMES) push(tool);
   return { tools, caps };
 }
 
