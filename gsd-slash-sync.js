@@ -800,22 +800,18 @@ const HOST_EXTENSION_TOOLS = Object.freeze({
 });
 
 /**
- * Web tools contributed by `pi-web-access`, restricted to GSD's research agents.
+ * Web tools contributed by `pi-web-access`. Every generated agent gets them.
  *
- * Two gates apply. The agent must have declared `WebSearch` / `WebFetch` (which
- * sets `caps.web`), and its name must look like a research role — so the
- * researchers and synthesizers that exist to look things up get network reach,
- * while a planner, debugger or framework selector that merely names a web tool
- * in passing stays off the network. Executors never qualify.
- *
- * The prompt already tells these children to use pi's equivalents; without this
- * the names never reached the allowlist and the advice pointed at tools the
- * child could not call.
+ * Policy lives in the prompt, not the allowlist: GSD's own agent text tells
+ * each child which lookups its job needs, so the generated `tools:` line only
+ * decides whether a tool exists in the child's registry — never who
+ * "deserves" it. The one exception stays `bg_*` / autoresearch / fan-out:
+ * those change what the child can *do* to the machine and session, not what
+ * it can read, and GSD's executors were never meant to spawn jobs or run
+ * experiments on their own.
  */
 const WEB_EXTENSION_PACKAGE = 'pi-web-access';
 const WEB_TOOL_NAMES = Object.freeze(['web_search', 'source_check', 'fetch_content', 'get_search_content']);
-/** Research roles that may reach the network. Matches the generated agent names. */
-const RESEARCH_AGENT_PATTERN = /(?:^|-)researcher$|(?:^|-)synthesizer$/;
 
 /** MCP server → human name for the fallback note written into the agent prompt. */
 const MCP_SERVER_LABELS = Object.freeze({
@@ -2676,7 +2672,6 @@ module.exports._internals = {
   detectHostExtensionTools,
   hostProvidesWebTools,
   WEB_TOOL_NAMES,
-  RESEARCH_AGENT_PATTERN,
   npmPackageName,
   isPackageInstalled,
   normalizeColonCommands,

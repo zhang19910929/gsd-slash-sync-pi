@@ -135,25 +135,28 @@ tool that is not named never reaches the child *even though the child did load t
 invisible because the generated allowlist only named pi builtins. Measured before the fix: across 19 GSD
 subagent runs (845 `bash` calls) not one extension tool was ever invoked.
 
-The division of labor is **allowlist = existence, prompt = selection**. GSD's own agent text already tells
-each child which lookups its job needs (research agents are told to search the web, the executor is told to
-read code); the allowlist only decides whether a tool exists for the child to pick up. The generator
-therefore checks pi's own `settings.json` (`packages`), confirms each package actually resolves under
-`<agentDir>/npm/node_modules`, and merges what it finds into every allowlist:
+**Division of labor: the allowlist grants existence, the prompt selects use.** Every generated agent gets the
+same tool surface — GSD's own agent text already tells each child which lookups its job needs (researchers
+are told to search the web, the executor is told to use web tools only for Context7-style doc lookups), and
+that guidance was unusable while the names were filtered out. Role restrictions that matter for integrity are
+kept where GSD put them: checker/auditor agents still receive no `write`/`edit` because GSD's own
+`tools:` lines never granted those, and that read-only discipline is what makes their verdicts trustworthy.
 
-| package | tools merged in |
-|---|---|
+The generator checks pi's `settings.json` (`packages`) and confirms each package resolves under
+`<agentDir>/npm/node_modules` before naming its tools:
+
+| package | tools merged into every allowlist |
+| --- | --- |
 | `@izhimu/pi-codegraph` | `codegraph_explore` |
 | `@ff-labs/pi-fff` | `ffgrep`, `fffind`, `fff-multi-grep` |
 | `pi-hashline-edit-pro` | `anchor_grep`, `replace`, `insert`, `undo_last_change` |
 | `pi-web-access` | `web_search`, `source_check`, `fetch_content`, `get_search_content` |
 
-A package that is absent contributes nothing, so an install without these extensions keeps exactly the
-allowlist it had before.
-
-**Deliberately excluded** — tools that change the child's behavior rather than its reach:
-`bg_*` / `fusion_*` (`pi-background-tasks`), `subagent` / `contact_supervisor` (only for agents GSD marks as
-nested-capable), and `pi-autoresearch`'s `init_experiment` / `run_experiment` / `log_experiment`.
+An install without a package contributes nothing, so the allowlists are byte-identical to the pre-2.2.1
+behavior there. Deliberately **not** merged, because they change what a child can *do* to the machine or the
+session rather than what it can read: `bg_*` / `fusion_*` (`pi-background-tasks`), `subagent` /
+`contact_supervisor` (except agents GSD marks as nested-capable), and `pi-autoresearch`'s
+`init_experiment` / `run_experiment` / `log_experiment`.
 
 **Skills need no equivalent change.** Skills are not tool-registry entries at all — pi formats them into the
 child's system prompt (`noSkills = !inheritSkills`), so they were never blocked by the allowlist. GSD's
