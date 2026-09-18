@@ -17,6 +17,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { execSync, spawnSync } from 'node:child_process';
 
 const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -47,7 +48,7 @@ const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-slash-sync-verify-'))
 // extras are `[]` and the assertions below are exactly the pre-detection ones).
 const extensionTools = _internals.detectHostExtensionTools(agentDir);
 const webTools = _internals.hostProvidesWebTools(agentDir);
-const withExtras = (base) => [...base.split(','), ...extensionTools, ...(webTools ? _internals.WEB_TOOL_NAMES : [])].sort().join(',');
+// `withExtras` is gone: extension tools no longer belong in the allowlist.
 
 // pi-subagents' user agent directory. Every sync/status call below redirects the
 // agent output into the temp root: writing GSD's 35 agent definitions into the
@@ -301,15 +302,53 @@ check('existing install survives the refusal', fs.readdirSync(guardDir).filter((
 
 // ── 9. extension registration surface ──────────────────────────────────────
 console.log('\n9) pi extension surface');
-const reg = { events: new Map(), commands: [], tools: [] };
+// Pin the guard severity: it is read from env/config inside plugin(), and the suite
+// must not depend on whatever this machine happens to have configured.
+process.env.GSD_SLASH_SYNC_TOOL_GUARD = 'warn';
+const reg = { events: new Map(), all: new Map(), commands: [], tools: [] };
 plugin({
-  on: (event, handler) => reg.events.set(event, handler),
+  // pi pushes onto a per-event list (see loader.js `on`), so the harness must too:
+  // `events` keeps the last handler for the single-handler assertions below, `all`
+  // keeps every handler for the events that legitimately have more than one.
+  on: (event, handler) => {
+    reg.events.set(event, handler);
+    const list = reg.all.get(event) || [];
+    list.push(handler);
+    reg.all.set(event, list);
+  },
   registerCommand: (name, options) => reg.commands.push({ name, options }),
   registerTool: (definition) => reg.tools.push(definition),
 });
 check('registers /gsd-sync', reg.commands.some((c) => c.name === 'gsd-sync'));
 check('subscribes to resources_discover', reg.events.has('resources_discover'));
 check('subscribes to session_start', reg.events.has('session_start'));
+check('subscribes to before_agent_start', reg.events.has('before_agent_start'));
+// The routing note is the mechanism that moved behaviour: it reaches the turn as a
+// message instead of sitting in a prompt. A handler returning nothing would fail
+// silently, so pin the shape pi consumes — and name only tools this host has,
+// because the note is generated from the same detection as the allowlists.
+const routingNote = await reg.events.get('before_agent_start')({}, {});
+const routingContent = (routingNote && routingNote.message && routingNote.message.content) || '';
+check(
+  'before_agent_start injects the routing table as a turn message',
+  routingNote &&
+    routingNote.message &&
+    routingNote.message.customType === 'gsd-tool-routing' &&
+    routingNote.message.display === false &&
+    typeof routingContent === 'string' &&
+    routingContent.includes('| job | use | not |') &&
+    routingContent.includes('build output, not source') &&
+    (extensionTools.includes('ffgrep') ? routingContent.includes('ffgrep') : true) &&
+    !/codegraph_explore/.test(routingContent) === !extensionTools.includes('codegraph_explore'),
+  routingContent.slice(0, 160),
+);
+// Latched: a second turn must not repeat it, or the prompt cache churns for nothing.
+// Deliberately does not call session_start here — that handler runs a real auto-sync.
+check(
+  'the routing note is injected at most once per session',
+  (await reg.events.get('before_agent_start')({}, {})) === undefined,
+);
+
 check('registers the gsd_slash_sync tool', reg.tools.some((t) => t.name === 'gsd_slash_sync'));
 const discovered = await reg.events.get('resources_discover')({ cwd: here, reason: 'startup' }, {});
 check(
@@ -379,19 +418,25 @@ const toolsOf = (file) => {
   const line = /^tools: (.*)$/m.exec(fmOf(file));
   return line ? line[1].split(',').map((s) => s.trim()).sort() : [];
 };
-check('gsd-planner tools mapped to pi builtins', toolsOf('gsd-planner.md').join(',') === withExtras('bash,edit,find,grep,read,write'), toolsOf('gsd-planner.md').join(','));
-check('GSD effort became pi thinking', /^thinking: xhigh$/m.test(fmOf('gsd-planner.md')));
-check('a low-effort agent keeps its lower level', /^thinking: low$/m.test(fmOf('gsd-codebase-mapper.md')));
+// The package auto-surfaces every loaded extension's tools, so the allowlist carries
+// built-ins only; a plain extension tool name in `tools:` is validated against the
+// built-in list and would fire `tools-error:` instead of adding the tool.
+check('gsd-planner tools are pi builtins only', toolsOf('gsd-planner.md').join(',') === 'bash,edit,find,grep,read,write', toolsOf('gsd-planner.md').join(','));
+check('no thinking level is emitted', !/^thinking:/m.test(fmOf('gsd-planner.md')));
+check('no effort-derived field survives', !/^effort:/m.test(fmOf('gsd-codebase-mapper.md')));
 check(
   'the YAML block-list form of tools: is read (gsd-security-auditor)',
-  toolsOf('gsd-security-auditor.md').join(',') === withExtras('bash,find,grep,read'),
+  toolsOf('gsd-security-auditor.md').join(',') === 'bash,find,grep,read',
   toolsOf('gsd-security-auditor.md').join(','),
 );
 check('Claude-only tool names never reach the frontmatter', !/^(tools|excludeTools): .*\b(Glob|Skill|WebFetch|WebSearch|AskUserQuestion|Agent)\b/m.test(fmOf('gsd-planner.md')));
 check('no mcp selector is emitted (an unresolvable one aborts the spawn)', !/mcp:/.test(agentSources.get('gsd-planner.md')));
 check('no Claude color/effort keys survive', !/^(color|effort):/m.test(fmOf('gsd-planner.md')));
-check('disallowedTools became excludeTools', /^excludeTools: edit$/m.test(fmOf('gsd-verifier.md')));
-const knownTools = new Set(['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'subagent', 'contact_supervisor', ...extensionTools, ..._internals.WEB_TOOL_NAMES]);
+// `excludeTools` / `disallowed_tools` is deliberately not emitted. Read-only agents
+// stay read-only because the package denies every built-in they did not ask for.
+check('no excludeTools is emitted', !/^excludeTools:/m.test(agentSources.get('gsd-verifier.md')));
+const BUILTINS = ['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls'];
+const knownTools = new Set(BUILTINS);
 check(
   'every allowlist is non-empty and uses only pi tool names',
   agentFiles.every((f) => {
@@ -400,22 +445,30 @@ check(
   }),
   agentFiles.filter((f) => !toolsOf(f).length || !toolsOf(f).every((t) => knownTools.has(t))).join(', '),
 );
+// Nested spawning is off, and the old orchestration tool names do not exist in the
+// installed package — naming either would only produce `tools-error:`.
 check(
-  'nested-spawn agents get subagent + allowNestedSubagents (gsd-debug-session-manager)',
-  toolsOf('gsd-debug-session-manager.md').includes('subagent') &&
-    toolsOf('gsd-debug-session-manager.md').includes('contact_supervisor') &&
-    /^allowNestedSubagents: true$/m.test(fmOf('gsd-debug-session-manager.md')),
+  'no agent claims a nested-spawn tool',
+  agentFiles.every((f) => !/^tools: .*\bsubagent\b/m.test(fmOf(f)) && !/^allowNestedSubagents:/m.test(fmOf(f))),
+  agentFiles.filter((f) => /^tools: .*\bsubagent\b/m.test(fmOf(f))).join(', '),
 );
-check('ordinary agents are not authorised to fan out', !/^allowNestedSubagents:/m.test(fmOf('gsd-planner.md')));
-check('AskUserQuestion maps to contact_supervisor', /^tools: .*\bcontact_supervisor\b/m.test(fmOf('gsd-eval-planner.md')));
+check(
+  'no agent names the removed contact_supervisor channel',
+  agentFiles.every((f) => !/^tools: .*\bcontact_supervisor\b/m.test(fmOf(f))),
+);
+check(
+  'the debug session manager no longer claims a spawn tool',
+  !toolsOf('gsd-debug-session-manager.md').includes('subagent'),
+  toolsOf('gsd-debug-session-manager.md').join(','),
+);
 // ── extension tools ────────────────────────────────────────────────────────
-// A declared allowlist is strict: an extension tool whose name is absent never
-// reaches the child, even though the child loaded the extension. The generator
-// therefore merges in the tools the host's installed packages provide.
+// Under @tintinweb/pi-subagents the allowlist is NOT how extension tools are
+// admitted: `allowedToolNames` is left unset, only un-asked built-ins are denied, and
+// an `ext:` selector is what narrows. So no extension tool name belongs in `tools:`.
 const hostTools = _internals.detectHostExtensionTools(agentDir);
 check(
-  'extension tools the host provides are merged into every allowlist',
-  agentFiles.every((f) => hostTools.every((t) => toolsOf(f).includes(t))),
+  'no extension tool name appears in any allowlist',
+  agentFiles.every((f) => hostTools.every((t) => !toolsOf(f).includes(t))),
   `hostTools=${hostTools.join(',') || '(none)'}`,
 );
 check(
@@ -430,22 +483,10 @@ check(
   // A package the plugin does not know about contributes nothing either.
   _internals.detectHostExtensionTools(agentDir, ['npm:pi-powerline-footer', 'npm:pi-mcp-adapter']).length === 0,
 );
-// Web tools go to every agent when the host provides them. The prompt is the
-// selector — GSD's own text tells each child which lookups its job needs — so
-// the allowlist only decides whether the tool exists, not when it is used.
+// Web tools arrive the same way every other extension tool does — automatically.
 const webToolNames = [..._internals.WEB_TOOL_NAMES];
-const hasWeb = (file) => webToolNames.every((t) => toolsOf(file).includes(t));
 const noWeb = (file) => webToolNames.every((t) => !toolsOf(file).includes(t));
-const webAvailable = _internals.hostProvidesWebTools(agentDir);
-if (webAvailable) {
-  check(
-    'every agent receives the web tools',
-    agentFiles.every((f) => hasWeb(f)),
-    agentFiles.filter((f) => !hasWeb(f)).join(', '),
-  );
-} else {
-  check('host without pi-web-access grants no web tools', agentFiles.every((f) => noWeb(f)));
-}
+check('web tool names are not listed either', agentFiles.every((f) => noWeb(f)));
 check(
   'a host without pi-web-access reports no web tools',
   _internals.hostProvidesWebTools(path.join(tmpRoot, 'no-such-agent-dir')) === false,
@@ -457,9 +498,12 @@ check(
     _internals.npmPackageName('./local') === '' &&
     _internals.npmPackageName('') === '',
 );
-check('Skill declaring agents inherit the pi skills catalogue', /^inheritSkills: true$/m.test(fmOf('gsd-planner.md')));
-check('agents without Skill do not', !/^inheritSkills:/m.test(fmOf('gsd-user-profiler.md')));
-check('every agent keeps repository instructions', agentFiles.every((f) => /^inheritProjectContext: true$/m.test(fmOf(f))));
+check('Skill declaring agents inherit the pi skills catalogue', /^skills: true$/m.test(fmOf('gsd-planner.md')));
+check('agents without Skill do not', !/^skills:/m.test(fmOf('gsd-user-profiler.md')));
+check(
+  'no context-inheritance field is emitted (the package has none that works)',
+  agentFiles.every((f) => !/^inherit(Project|Global)Context:/m.test(fmOf(f)) && !/^inherit_context:/m.test(fmOf(f))),
+);
 
 // ── body rewriting ─────────────────────────────────────────────────────────
 check(
@@ -508,10 +552,16 @@ check(
   })(),
 );
 check(
-  'the child contract names the AskUserQuestion / Skill / web substitutions',
-  /contact_supervisor/.test(agentSources.get('gsd-framework-selector.md')) &&
+  'the child contract names the substitutions it still has',
+  /child-to-parent channel/.test(agentSources.get('gsd-framework-selector.md')) &&
     /`Skill` is not a tool in pi/.test(agentSources.get('gsd-planner.md')) &&
     /pi web tools/.test(agentSources.get('gsd-planner.md')),
+);
+check(
+  'the child contract no longer promises a spawn or a supervisor tool',
+  !/call `contact_supervisor`/.test(agentSources.get('gsd-framework-selector.md')) &&
+    !/subagent\(\{ agent, task \}\)/.test(agentSources.get('gsd-debug-session-manager.md')) &&
+    /Nested spawning is/.test(agentSources.get('gsd-debug-session-manager.md')),
 );
 
 // ── global context file ────────────────────────────────────────────────────
@@ -548,10 +598,21 @@ check(
     );
   })(),
 );
+// The field is gone with the package that honoured it: @tintinweb/pi-subagents builds
+// child sessions with `noContextFiles: true`, so emitting it would be a lie.
 check(
-  'every generated agent declares inheritGlobalContext',
-  agentFiles.every((f) => /^inheritGlobalContext: true$/m.test(fmOf(f))),
-  agentFiles.filter((f) => !/^inheritGlobalContext: true$/m.test(fmOf(f))).join(', '),
+  'no agent declares a context-inheritance flag the package ignores',
+  agentFiles.every((f) => !/^inheritGlobalContext:/m.test(fmOf(f))),
+  agentFiles.filter((f) => /^inheritGlobalContext:/m.test(fmOf(f))).join(', '),
+);
+check(
+  'the frontmatter carries only fields the installed package reads',
+  agentFiles.every((f) =>
+    fmOf(f).split('\n').filter((l) => /^[a-z_]+:/.test(l))
+      .every((l) => ['name:', 'description:', 'tools:', 'skills:'].some((k) => l.startsWith(k))),
+  ),
+  agentFiles.filter((f) => fmOf(f).split('\n').filter((l) => /^[a-z_]+:/.test(l))
+    .some((l) => !['name:', 'description:', 'tools:', 'skills:'].some((k) => l.startsWith(k)))).join(', '),
 );
 check(
   'the agent body no longer carries the guidance prose',
@@ -623,9 +684,9 @@ check(
   })(),
 );
 check(
-  'every generated agent carries a thinking level',
-  [...agentSources.keys()].every((n) => /^thinking: /m.test(fmOf(n))),
-  [...agentSources.keys()].filter((n) => !/^thinking: /m.test(fmOf(n))).join(', '),
+  'no generated agent pins a thinking level',
+  [...agentSources.keys()].every((n) => !/^thinking: /m.test(fmOf(n))),
+  [...agentSources.keys()].filter((n) => /^thinking: /m.test(fmOf(n))).join(', '),
 );
 check(
   'the effort catalog is memoised per resolved table pair',
@@ -668,12 +729,18 @@ check(
     _internals.readonlyDenyFingerprint(undefined, path.join(piCore, 'agents')) &&
     _internals.readonlyDenyFingerprint('/nonexistent-core', '/nonexistent-src') === '',
 );
+// The deny-list is no longer emitted, so what keeps a checker read-only is the
+// allowlist: the package denies every built-in the agent did not ask for.
 check(
-  'only the named read-only agents carry excludeTools',
-  (() => {
-    const withDeny = agentFiles.filter((f) => /^excludeTools: /m.test(fmOf(f))).map((f) => f.replace(/\.md$/, '')).sort();
-    return withDeny.join(',') === ['gsd-doc-verifier', 'gsd-eval-auditor', 'gsd-integration-checker', 'gsd-plan-checker', 'gsd-ui-auditor', 'gsd-ui-checker', 'gsd-verifier'].join(',');
-  })(),
+  'the read-only agents still cannot edit',
+  ['gsd-doc-verifier', 'gsd-eval-auditor', 'gsd-integration-checker', 'gsd-plan-checker', 'gsd-ui-auditor', 'gsd-ui-checker', 'gsd-verifier']
+    .every((n) => !toolsOf(`${n}.md`).includes('edit')),
+  ['gsd-doc-verifier', 'gsd-eval-auditor', 'gsd-integration-checker', 'gsd-plan-checker', 'gsd-ui-auditor', 'gsd-ui-checker', 'gsd-verifier']
+    .filter((n) => toolsOf(`${n}.md`).includes('edit')).join(', '),
+);
+check(
+  'no agent emits a deny-list field at all',
+  agentFiles.every((f) => !/^(excludeTools|disallowed_tools):/m.test(fmOf(f))),
 );
 
 
@@ -713,12 +780,14 @@ check(
 
 // ── parent-side dispatch contract ─────────────────────────────────────────
 const dispatchTemplate = fs.readFileSync(path.join(tmpRoot, 'agents-cmds', 'gsd-plan-phase.md'), 'utf8');
-check('commands carry the subagent dispatch translation', dispatchTemplate.includes('subagent({ agent: "gsd-planner", task:'));
-check('the translation covers general-purpose → delegate', dispatchTemplate.includes('agent: "delegate"'));
-check('the translation covers background/foreground', dispatchTemplate.includes('`async: false`'));
-check('the translation names pi-subagents\u2019 parallel form', dispatchTemplate.includes('runs.all'));
+check('commands carry the Agent dispatch translation', dispatchTemplate.includes('Agent({ subagent_type: "gsd-planner"'));
+check('the translation states the required description field', dispatchTemplate.includes('description:'));
+check('the translation covers background/foreground', dispatchTemplate.includes('`run_in_background: false`'));
+check('the translation names the result-retrieval tool', dispatchTemplate.includes('get_subagent_result'));
+check('the translation names the parallel form', dispatchTemplate.includes('SubagentWorkflow'));
 check('the translation warns about resolve-dispatch-type', dispatchTemplate.includes('resolve-dispatch-type'));
-check('the translation lists the installed roles', /`gsd-planner`/.test(dispatchTemplate) && /agents="35"/.test(dispatchTemplate));
+check('the translation drops the old call shape', !/subagent\(\{ agent:/.test(dispatchTemplate));
+check('the translation carries the agent count', /agents="35"/.test(dispatchTemplate));
 const noAgentsDir = path.join(tmpRoot, 'agents-disabled');
 const noAgents = plugin.sync({ agentDir, outDir: path.join(tmpRoot, 'agents-disabled-cmds'), agentsOut: noAgentsDir, mode: 'reference', persist: false, noAgents: true, cwd: here });
 check('--no-agents skips the agent set', noAgents.agents.enabled === false && (!fs.existsSync(noAgentsDir) || fs.readdirSync(noAgentsDir).length === 0));
@@ -755,72 +824,146 @@ check(
   })(),
 );
 
-// ── real discovery through the installed pi-subagents ─────────────────────
-// What matters is not that files exist but that pi-subagents loads them as
-// agents. Its own discovery is imported through jiti (the loader pi itself uses
-// for TS extensions) and pointed at the temp directory, so the assertion holds on
-// a machine where pi-subagents is installed and is skipped where it is not.
+// ── real discovery through the installed @tintinweb/pi-subagents ───────────
+// Files existing is not the claim; the claim is that the package parses them into
+// the configuration we intended. So its own loader runs, pointed at the temp agents
+// directory, and the check is on what it returns.
 //
-// Both discovery roots are redirected for the probe: with a real install present
-// the identical `gsd-*` names in <agentDir>/agents would win the name merge and
-// mask whatever the temp directory produced, so the probe would pass even if the
-// generated files were broken.
-const jitiPath = path.join(agentDir, 'npm', 'node_modules', 'jiti', 'lib', 'jiti.cjs');
-const piSubagentsDir = path.join(agentDir, 'npm', 'node_modules', 'pi-subagents');
-if (fs.existsSync(jitiPath) && fs.existsSync(piSubagentsDir)) {
-  const savedEnv = {
-    extra: process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS,
-    agentDir: process.env.PI_CODING_AGENT_DIR,
-  };
-  process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS = agentsDir;
-  process.env.PI_CODING_AGENT_DIR = path.join(tmpRoot, 'empty-agent-dir');
+// Three mechanics worth knowing, because each one cost a failed attempt:
+//
+//   - Node refuses to strip types inside node_modules
+//     (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`), so the package's TypeScript
+//     source cannot be imported directly; its compiled `dist/custom-agents.js` can.
+//     The jiti the old probe used is gone with the old package.
+//   - The package declares pi as a *peer* dependency, so pi has to be resolvable
+//     from where the package resolves it. Symlinking pi into the probe's
+//     `node_modules` is not enough on its own: without `--preserve-symlinks` Node
+//     follows the symlink back to the package's real path and walks up from there,
+//     where pi is not installed. Hence the child process with the flag.
+//   - `loadCustomAgents(cwd)` also reads `<cwd>/.pi/agents` and `<cwd>/.agents/agents`,
+//     and `PI_CODING_AGENT_DIR` selects the global root. Both are redirected, because
+//     with a real install present the identical `gsd-*` names would win the name merge
+//     and mask a broken generation.
+function resolvePiInstall() {
+  const candidates = [];
   try {
-    const { createJiti } = require(jitiPath);
-    const jiti = createJiti(path.join(here, 'verify.mjs'), { interopDefault: true, moduleCache: false });
-    const mod = await jiti.import(path.join(piSubagentsDir, 'src', 'agents', 'agents.ts'));
-    mod.clearAgentDiscoveryCache?.();
-    const found = mod.discoverAgents(here, 'user');
-    const generated = Object.keys(agentState.files).map((f) => f.replace(/\.md$/, ''));
-    const ours = found.agents.filter((a) => (a.filePath || '').startsWith(agentsDir));
-    const discovered = new Set(ours.map((a) => a.name));
+    candidates.push(path.dirname(require.resolve('@earendil-works/pi-coding-agent/package.json')));
+  } catch {
+    // Not resolvable from the suite; the global root below usually still is.
+  }
+  try {
+    for (const root of execSync('npm root -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n')) {
+      candidates.push(path.join(root, '@earendil-works', 'pi-coding-agent'));
+    }
+  } catch {
+    // npm not on PATH — the probe skips rather than fails.
+  }
+  return candidates.find((p) => p && fs.existsSync(path.join(p, 'package.json'))) || null;
+}
+
+const piInstall = resolvePiInstall();
+const installedPackage = path.join(agentDir, 'npm', 'node_modules', '@tintinweb', 'pi-subagents');
+const packageEntry = path.join(installedPackage, 'dist', 'custom-agents.js');
+
+if (piInstall && fs.existsSync(packageEntry)) {
+  const probeRoot = path.join(tmpRoot, 'discovery-probe');
+  const probeAgentDir = path.join(probeRoot, 'agentdir');
+  const probeCwd = path.join(probeRoot, 'cwd');
+  fs.mkdirSync(path.join(probeAgentDir, 'agents'), { recursive: true });
+  fs.mkdirSync(probeCwd, { recursive: true });
+  for (const file of fs.readdirSync(agentsDir).filter((n) => n.endsWith('.md'))) {
+    fs.copyFileSync(path.join(agentsDir, file), path.join(probeAgentDir, 'agents', file));
+  }
+  const probeModules = path.join(probeRoot, 'node_modules');
+  fs.mkdirSync(path.join(probeModules, '@earendil-works'), { recursive: true });
+  fs.mkdirSync(path.join(probeModules, '@tintinweb'), { recursive: true });
+  fs.symlinkSync(piInstall, path.join(probeModules, '@earendil-works', 'pi-coding-agent'));
+  for (const peer of ['pi-ai', 'pi-tui']) {
+    const peerPath = path.join(path.dirname(piInstall), peer);
+    if (fs.existsSync(peerPath)) fs.symlinkSync(peerPath, path.join(probeModules, '@earendil-works', peer));
+  }
+  fs.symlinkSync(installedPackage, path.join(probeModules, '@tintinweb', 'pi-subagents'));
+
+  const shim = path.join(probeRoot, 'probe.mjs');
+  fs.writeFileSync(
+    shim,
+    [
+      "const mod = await import('@tintinweb/pi-subagents/dist/custom-agents.js');",
+      "const agents = mod.loadCustomAgents(process.argv[2]);",
+      "const out = { count: agents.size, agents: {} };",
+      "for (const [name, cfg] of agents) {",
+      "  out.agents[name] = {",
+      "    description: cfg.description ?? null,",
+      "    builtinToolNames: cfg.builtinToolNames ?? null,",
+      "    skills: cfg.skills === undefined ? null : cfg.skills,",
+      "    thinking: cfg.thinking === undefined ? null : cfg.thinking,",
+      "    disallowedTools: cfg.disallowedTools === undefined ? null : cfg.disallowedTools,",
+      "  };",
+      "}",
+      "process.stdout.write(JSON.stringify(out));",
+      "",
+    ].join('\n'),
+  );
+
+  const run = spawnSync(process.execPath, ['--preserve-symlinks', shim, probeCwd], {
+    encoding: 'utf8',
+    env: { ...process.env, PI_CODING_AGENT_DIR: probeAgentDir },
+    maxBuffer: 32 * 1024 * 1024,
+  });
+
+  let probed = null;
+  try {
+    probed = JSON.parse(run.stdout || '');
+  } catch {
+    probed = null;
+  }
+
+  if (!probed || typeof probed.count !== 'number') {
     check(
-      'pi-subagents discovers every generated GSD agent',
-      generated.length === 35 && generated.every((n) => discovered.has(n)),
-      `generated=${generated.length} discovered=${discovered.size} missing=${generated.filter((n) => !discovered.has(n)).join(', ')}`,
+      'the installed package loads the generated agents',
+      false,
+      (run.stderr || run.stdout || 'no output').split('\n').slice(0, 3).join(' | '),
     );
-    const planner = ours.find((a) => a.name === 'gsd-planner');
-    check('pi-subagents reads the mapped tool allowlist', planner && planner.tools.join(',') === ['read', 'write', 'edit', 'bash', 'find', 'grep', ...extensionTools, ...(webTools ? _internals.WEB_TOOL_NAMES : [])].join(','), planner && planner.tools.join(','));
-    check('pi-subagents reads the thinking level', planner && planner.thinking === 'xhigh', planner && String(planner.thinking));
-    check('pi-subagents reads the excludeTools mapping', (ours.find((a) => a.name === 'gsd-verifier') || {}).excludeTools?.join(',') === 'edit');
-    const manager = ours.find((a) => a.name === 'gsd-debug-session-manager');
-    check('pi-subagents reads the nested-fanout flag', manager && manager.allowNestedSubagents === true);
-    // The global-context guidance depends on pi-subagents actually honouring this
-    // field, not merely on us writing it. `thinking` and `excludeTools` already
-    // have this kind of round-trip assertion; without one here, a pi-subagents
-    // change that stops reading the field would silently disable the guidance for
-    // every child while the generated files still looked correct.
+  } else {
+    const names = Object.keys(agentState.files).map((f) => f.replace(/\.md$/, ''));
+    const missing = names.filter((n) => !probed.agents[n]);
+    // Not `count === 35`: this directory also holds the suite's own foreign fixture,
+    // which the package is expected to load too. What matters is that every name we
+    // generated came back.
     check(
-      'pi-subagents reads the global-context inheritance flag',
-      // Scoped to the agents we generated: this discovery root also holds the
-      // suite's own foreign fixtures, which carry no such flag by design.
-      (() => {
-        const byName = new Map(ours.map((a) => [a.name, a]));
-        const missing = generated.filter((n) => (byName.get(n) || {}).inheritGlobalContext !== true);
-        return generated.length === 35 && missing.length === 0;
-      })(),
-      generated.filter((n) => ((ours.find((a) => a.name === n) || {}).inheritGlobalContext) !== true).join(', '),
+      'the installed package discovers every generated agent',
+      missing.length === 0 && probed.count >= names.length,
+      `count=${probed.count} expected>=${names.length} missing=${missing.join(', ')}`,
     );
-    check('pi-subagents accepts every generated agent with no diagnostics', found.agentDiagnostics.filter((d) => (d.filePath || '').startsWith(agentsDir)).length === 0, JSON.stringify(found.agentDiagnostics.filter((d) => (d.filePath || '').startsWith(agentsDir))));
-  } catch (err) {
-    check('pi-subagents discovery probe', false, err && err.message ? err.message : String(err));
-  } finally {
-    if (savedEnv.extra === undefined) delete process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS;
-    else process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS = savedEnv.extra;
-    if (savedEnv.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = savedEnv.agentDir;
+    // A file the package cannot parse is skipped, so a full count is the proxy for
+    // "loaded with no diagnostics" — its warning list is module-internal.
+    check(
+      'the package parses the allowlist we wrote',
+      names.every((n) => (probed.agents[n].builtinToolNames || []).slice().sort().join(',') === toolsOf(`${n}.md`).join(',')),
+      names
+        .filter((n) => (probed.agents[n].builtinToolNames || []).slice().sort().join(',') !== toolsOf(`${n}.md`).join(','))
+        .slice(0, 4)
+        .join(' '),
+    );
+    // `skills` defaults to *inherit* in the package (`inheritField(undefined) === true`),
+    // so the flag we emit for GSD's Skill-granted agents is belt-and-braces rather than
+    // the thing that turns inheritance on — and every agent reports true either way.
+    // Same for `extensions`, which is why extension tools arrive unasked.
+    check(
+      'every agent inherits the skills catalogue',
+      names.every((n) => probed.agents[n].skills === true),
+      names.filter((n) => probed.agents[n].skills !== true).join(', '),
+    );
+    check(
+      'the package reports no reasoning lock and no deny-list',
+      names.every((n) => probed.agents[n].thinking === null && probed.agents[n].disallowedTools === null),
+      names.filter((n) => probed.agents[n].thinking !== null || probed.agents[n].disallowedTools !== null).join(', '),
+    );
   }
 } else {
-  console.log('  skip pi-subagents discovery probe (pi-subagents or jiti not installed)');
+  console.log(
+    `  skip installed-package discovery probe (pi install ${piInstall ? 'found' : 'not found'}, package entry ${fs.existsSync(packageEntry) ? 'found' : 'missing'})`,
+  );
 }
 
 // ── 11. hygiene: the suite must not mutate the real install ────────────────
