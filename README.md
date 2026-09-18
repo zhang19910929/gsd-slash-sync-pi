@@ -1,7 +1,7 @@
 # gsd-slash-sync
 
 Sync **GSD Core's slash commands and subagents** into **pi (pi.dev)** — as native prompt templates and as
-**pi-subagents** agent definitions — and re-sync them with one command whenever GSD Core updates.
+**@tintinweb/pi-subagents** agent definitions — and re-sync them with one command whenever GSD Core updates.
 
 ```
 /gsd-plan-phase  /gsd-execute-phase  /gsd-verify-work  /gsd-ship  …   72 commands
@@ -18,12 +18,12 @@ while Claude Code gets both. That is why pi has only `/gsd`, no `gsd-*` subagent
 
 This plugin closes both gaps **without forking GSD**: it converts the definitions GSD already installed
 for another runtime, registers the commands through pi's `resources_discover` event, and writes the agents
-where pi-subagents discovers them. **No GSD file is ever modified.**
+where `@tintinweb/pi-subagents` discovers them. **No GSD file is ever modified.**
 
 ```
 already on disk (canonical source)          generated for pi
 ~/.claude/gsd-core/commands/gsd/*.md   →    ~/.pi/agent/gsd-commands/gsd-*.md   (prompt templates)
-~/.claude/gsd-core/agents/*.md         →    ~/.pi/agent/agents/gsd-*.md        (pi-subagents)
+~/.claude/gsd-core/agents/*.md         →    ~/.pi/agent/agents/gsd-*.md        (@tintinweb/pi-subagents)
                                        →    ~/.pi/agent/AGENTS.md              (shared tool guidance)
 ```
 
@@ -53,7 +53,7 @@ pi auto-discovers `*.js` / `*.ts` in `extensions/`, so **no `settings.json` chan
 |---|---|---|
 | **pi** | everything | https://pi.dev |
 | A **GSD Core install for another runtime** | the source definitions — commands *and* agents | `npx -y @opengsd/gsd-core@latest --claude` |
-| **pi-subagents** | the 35 agents; without it the generated files are inert | `pi install npm:pi-subagents` |
+| **@tintinweb/pi-subagents** | the 35 agents; without it the generated files are inert | `pi install npm:@tintinweb/pi-subagents` |
 | **pi-web-access** | the web tools the research/audit agents use | `pi install npm:pi-web-access` |
 | **pi-mcp-adapter** (optional) | MCP servers you configure yourself | `pi install npm:pi-mcp-adapter`, then `/mcp setup` |
 
@@ -62,17 +62,18 @@ pi auto-discovers `*.js` / `*.ts` in `extensions/`, so **no `settings.json` chan
 The plugin never ships GSD's definitions — it converts a GSD Core copy already on disk. **Claude Code itself
 is not required**: GSD's installer is a file-layout installer, it never probes for a `claude` binary.
 
-| Source | Cmds | Agents | `thinking:` / `excludeTools:` |
-|---|---|---|---|
-| **`~/.claude/gsd-core/commands/gsd` + `~/.claude/agents`** ← recommended | 72 | 35 | **yes** |
-| The npm package itself (`<npx cache>/node_modules/@opengsd/gsd-core/`) | 72 | 35 | no |
-| Any other runtime install (qwen, copilot, opencode, kilo, codebuddy, …) | yes | yes | no |
-| cursor, windsurf, codex, kimi | yes | **no** | — |
-| `--pi` only | **no** | **no** | — |
+| Source | Cmds | Agents |
+|---|---|---|
+| **`~/.claude/gsd-core/commands/gsd` + `~/.claude/agents`** ← recommended | 72 | 35 |
+| The npm package itself (`<npx cache>/node_modules/@opengsd/gsd-core/`) | 72 | 35 |
+| Any other runtime install (qwen, copilot, opencode, kilo, codebuddy, …) | yes | yes |
+| cursor, windsurf, codex, kimi | yes | **no** |
+| `--pi` only | **no** | **no** |
 
-Only the Claude Code layout carries a per-agent `effort:` (35/35) and `disallowedTools:` (7) — exactly what
-become pi's `thinking:` and `excludeTools:`. The other trees carry pristine frontmatter, so those two fields
-are absent and pi's default reasoning level applies.
+The Claude Code layout is still the recommended one — it is the tree GSD's own installer stages for a
+runtime, so it is the copy GSD means you to convert. It also injects a per-agent `effort:` and
+`disallowedTools:`, but the generated contract no longer uses either (see §8.1): the reasoning level is
+left to inherit, and read-only agents are kept read-only by the allowlist alone.
 
 `--source <dir>` (or `GSD_SLASH_SYNC_SOURCE`) points at a specific `commands/gsd`; agents are then taken from
 the `agents/` directory **beside that same tree**, never mixed across GSD versions. Zero-install path:
@@ -100,11 +101,13 @@ changed, or the plugin/mode/naming changed → regenerate and report
 session already has the new commands and agents.** Disable with `"autoSync": false` or
 `GSD_SLASH_SYNC_AUTO=off`.
 
-**Spawning agents.** Every generated command carries a `<gsd_subagent_dispatch>` block that turns GSD's
-`Agent(subagent_type="gsd-planner", …)` into `subagent({ agent: "gsd-planner", task: "…" })` —
-`run_in_background: false` → `async: false`, `subagent_type="general-purpose"` → `agent: "delegate"`,
-`TaskOutput` → `subagent({action:"status", id})`, parallel spawns collapsing into one `workflowScript` call
-with `runs.all([...])`.
+**Spawning agents.** GSD writes its spawn steps for Claude Code's `Agent` tool, and the installed package
+happens to have a tool by that same name — so the translation is mostly a parameter rename. Every generated
+command carries a `<gsd_subagent_dispatch>` block stating it: `Agent({ subagent_type: "gsd-planner", prompt:
+"…", description: "…" })`, where `description` is required by the schema; `run_in_background` is the same
+field with the same meaning; `TaskOutput` becomes `get_subagent_result({ agent_id })`; several spawns in one
+step become one `SubagentWorkflow` call. `subagent_type="general-purpose"` is already the package's own
+default agent, so it passes through unchanged.
 
 ## Modes (default: `reference`)
 
@@ -132,7 +135,7 @@ prompt every turn — so `reference` is the better default there too. `/gsd-sync
   "naming": "hyphen",         // hyphen | colon  (/gsd-plan-phase vs /gsd:plan-phase)
   "outDir": null,             // default <agentDir>/gsd-commands
   "agentsOut": null,          // default <agentDir>/agents
-  "syncAgents": true,         // convert GSD's subagents for pi-subagents
+  "syncAgents": true,         // convert GSD's subagents for the installed package
   "syncGlobalContext": true,  // generate <agentDir>/AGENTS.md
   "source": null,             // explicit commands/gsd directory
   "maxInlineKb": 0,           // inline mode: fall back above this size (0 = no limit)
@@ -156,8 +159,10 @@ CLI values are **written back to the config file** (otherwise the next automatic
 ~/.pi/agent/extensions/gsd-slash-sync.js    the plugin
 ```
 
-`~/.pi/agent/agents/` is pi-subagents' documented *user* directory and the same path GSD's
-`getAgentsDir('pi')` resolves to; a project's `.pi/agents/*.md` still wins over it.
+`$PI_CODING_AGENT_DIR/agents/` is the package's documented *global* agent location — and the same path GSD's
+`getAgentsDir('pi')` resolves to. Agents are discovered from three places, highest priority first:
+`.pi/agents/` (project) → `.agents/agents/` (project, shared cross-tool workspace) → the global directory
+this plugin writes. A project file with the same `name:` therefore overrides the generated one.
 
 - **Deterministic** — bytes depend only on source + mode + naming, no timestamps, so re-syncing is a true
   no-op. `--naming colon` affects command names only; agent bytes are identical either way.
@@ -179,39 +184,53 @@ protected from pi's template substitution, and Claude-shaped paths (152 occurren
 
 **Agents.**
 
-| GSD (Claude dialect) | pi-subagents | Notes |
+| GSD (Claude dialect) | generated frontmatter | Notes |
 |---|---|---|
-| `Read` `Write` `Edit` `Bash` `Grep` `Glob` | `read` `write` `edit` `bash` `grep` `find` | |
-| `Agent` | `subagent` + `allowNestedSubagents` | only `gsd-debug-session-manager` |
-| `AskUserQuestion` | `contact_supervisor` | a child cannot prompt the user directly |
-| `Skill` | `inheritSkills: true` | skills are prompt-time, not a tool |
-| `WebSearch`, `WebFetch`, `mcp__*` | — dropped | an unresolvable `mcp:` selector **aborts the spawn** |
-| `effort:` | `thinking:` | derived from GSD's routing tables |
-| `disallowedTools:` | `excludeTools:` | e.g. `gsd-verifier` loses `edit` |
-| — | `inheritProjectContext` `inheritGlobalContext` | without these pi strips repo instructions and `AGENTS.md` |
+| `Read` `Write` `Edit` `Bash` `Grep` `Glob` | `read` `write` `edit` `bash` `grep` `find` | `Glob` → pi's glob-style `find` |
+| `Skill` | `skills: true` | skills are a prompt-time catalogue, not a tool |
+| `Agent`, `Task` | **nothing** | nested spawning is off, and the package denies its own orchestration tools |
+| `AskUserQuestion` | **nothing** | the old child→parent channel is not registered; the contract says to put the question in the final report |
+| `WebSearch`, `WebFetch`, `mcp__*` | **nothing** | the tools arrive from the loaded extensions; a plain name in `tools:` is validated against the built-in list and would only fire `tools-error:` |
+| `effort:` | **nothing** | left to inherit on purpose — see below |
+| `disallowedTools:` | **nothing** | read-only agents stay read-only because the package denies every built-in they did not ask for |
 
-`thinking:` and `excludeTools:` are **read from the installed GSD Core, not hardcoded** —
-`bin/shared/model-catalog.json` (`routingTier`), `bin/shared/config-defaults.manifest.json`
-(`effort.routing_tier_defaults`: light→low, standard→high, heavy→xhigh) and
-`READONLY_AGENT_DISALLOWED_TOOLS` in `bin/lib/runtime-artifact-conversion.cjs` — so they follow a GSD update
-instead of drifting from it.
+Three of those are deliberate omissions rather than gaps:
+
+- **`tools:` carries pi built-ins only.** The package leaves `allowedToolNames` unset and denies merely the
+  built-ins an agent did not ask for, so *every loaded extension's tools surface by themselves*. An `ext:`
+  selector is what narrows that — and a plain extension tool name is checked against the built-in list, so
+  naming one adds nothing and fires `tools-error:`. Verified on a real install: a child reported `ffgrep`
+  and `codegraph_explore` callable while the generated `tools:` line named neither.
+- **`thinking:` is not emitted.** Frontmatter is *authoritative and locked* — "Agent tool parameters only
+  fill fields the agent config leaves unspecified" — so pinning a level here would freeze it against the
+  caller. Left out it is `undefined`, which the package documents as *inherit*: a child follows the
+  session's current level and the caller can still override per call. GSD's per-role routing tier
+  (`bin/shared/model-catalog.json`, `config-defaults.manifest.json`) is still digested into the sync
+  fingerprint, but it is not turned into a locked level.
+- **No `inheritProjectContext` / `inheritGlobalContext`.** The package builds child sessions with
+  `noContextFiles: true` hardcoded, so no context file reaches a child by any setting. `inherit_context` is
+  a different feature — it forks the *parent conversation* — and is not what GSD's workers want.
 
 `.compact.md` siblings are deliberately not installed: they share their canonical agent's `name:` and would
 register as separate `gsd-<role>.compact` agents.
 
 ## Global context (`AGENTS.md`)
 
-pi-subagents **strips** the global context file from children unless the agent declares
-`inheritGlobalContext`. Every generated agent emits the flag, which makes `~/.pi/agent/AGENTS.md` the single
-channel reaching **both** the top-level session and every spawned child — the same tool guidance for the
-operator and the children. (Duplicating it into 35 agent bodies would say the same thing 35 times and could
-not reach the top-level session at all.)
+This file serves the **top-level session only**, and the section states that in as many words so nobody
+later assumes otherwise. Under the old pi-subagents it also reached children, via an `inheritGlobalContext`
+flag; that package is gone and the installed one hardcodes `noContextFiles: true`, so there is no setting
+that would put a context file in front of a child.
+
+Children get their guidance from their own prompt (the agent body) and from the task text they are handed —
+which is why the sync also writes a `<task_tool_routing>` block into every generated command, for the
+orchestrator to paste into the task it passes a child.
 
 The file is generated from the tools the host **actually** has, so it can never name an uninstalled tool:
 
 | Section | Emitted when |
 |---|---|
-| `## Searching` — prefer `ffgrep` / `fffind` over recursive walks | `@ff-labs/pi-fff` |
+| `## Tool choice` — the job → tool table, emitted per installed tool | any indexed tool (`@ff-labs/pi-fff`, `@izhimu/pi-codegraph`, `pi-hashline-edit-pro`) |
+| `## Build output is not source` — never search `target/`, `node_modules/`, `dist/`, `.git/` | `@ff-labs/pi-fff` |
 | `## Structural questions` — use `codegraph_explore` | `@izhimu/pi-codegraph` |
 | `## Editing` — use `anchor_grep` / `replace` / `insert`, not `sed -i` | `pi-hashline-edit-pro` |
 | `## Web lookups` — `web_search` / `fetch_content` | `pi-web-access` |
@@ -222,48 +241,62 @@ needs **`/reload`** before it sees new guidance.
 
 ## Tool surface
 
-A generated `tools:` line is a **strict allowlist**: pi-subagents filters the child's registry down to the
-names listed, and extension tools are filtered exactly like builtins — so an unnamed extension tool never
-reaches the child even though the child loaded the extension.
+`extensions:` decides which extensions load; `tools:` decides which tools surface. The distinction is what
+the generated agents rely on, and it is the opposite of the old package's model.
 
-Every generated agent therefore gets the **same** surface. GSD's own agent text already says which lookups
-each role needs, so the allowlist decides only whether a tool *exists* — never who "deserves" it. Merged when
-the package resolves under `<agentDir>/npm/node_modules`:
+- **Omitted `tools:`** → all seven pi built-ins, plus every tool from every loaded extension.
+- **`tools: read, grep, find`** → those built-ins; the extension tools still come along.
+- **Any `ext:` entry** → extension tools flip to an explicit allowlist. `ext:pi-fff/ffgrep` surfaces that one
+  tool and nothing else from any other extension, while unnamed extensions still load (their hooks fire).
+- **`exclude_extensions:`** wins over everything, takes plain names only, and is explicitly *not* a sandbox.
 
-| package | tools |
+So the generated agents list **built-ins only** and name no extension tool: naming one is checked against the
+built-in list, fires `tools-error:`, and adds nothing. Read-only agents are kept read-only the same way — by
+not asking for `write`/`edit`, which the package then denies.
+
+That is why the earlier "merge every installed package's tools into every allowlist" step is gone. It was
+required under pi-subagents, where an unnamed extension tool never reached the child even though the child
+had loaded the extension; under the installed package the default is the reverse.
+
+| package | what it contributes |
 |---|---|
 | `@izhimu/pi-codegraph` | `codegraph_explore` |
-| `@ff-labs/pi-fff` | `ffgrep`, `fffind` |
+| `@ff-labs/pi-fff` | `ffgrep`, `fffind` (and `fff-multi-grep` only with `PI_FFF_MULTIGREP=1`) |
 | `pi-hashline-edit-pro` | `anchor_grep`, `replace`, `insert`, `undo_last_change` |
 | `pi-web-access` | `web_search`, `source_check`, `fetch_content`, `get_search_content` |
 
-**Only tools a package registers unconditionally may be listed.** A strict allowlist that names an
-unregistered tool does not degrade — pi-subagents fails the entire spawn with `requested unavailable child
-tools`. pi-fff is the worked example: it registers `fff-multi-grep` only when `PI_FFF_MULTIGREP=1`, so
-naming it broke every one of the 35 agents on a default install. That is a policy, not just a workaround: a
-package that keeps a capability behind an opt-in has chosen its default posture, so the sync does not
-overrule it by turning the opt-in on. `fff-multi-grep` stays out of the table even with
-`PI_FFF_MULTIGREP=1` set.
+A package that keeps a capability behind an opt-in has chosen its default posture, and the sync does not
+overrule it — `fff-multi-grep` is the worked example. Under the old package naming it was worse than
+useless: an unregistered name failed the entire spawn with `requested unavailable child tools`. Under the
+installed one it merely fires `tools-error:`. Either way the table above is a description of what arrives
+on its own, not a list the sync writes.
 
-Deliberately **not** merged, because they change what a child can *do* to the machine or session rather than
-what it can read: `bg_*` / `fusion_*`, `subagent` / `contact_supervisor` (except agents GSD marks
-nested-capable), and `init_experiment` / `run_experiment` / `log_experiment`.
-
-Skills need no equivalent change — they are not registry entries; pi formats them into the prompt
-(`noSkills = !inheritSkills`).
+Skills need no equivalent change: they are not registry entries, pi formats them into the prompt, and
+`skills: true` is emitted for every agent GSD grants `Skill` to.
 
 ## Verification
 
 ```bash
-node test/verify.mjs         # 146 checks: drives pi's real template engine and pi-subagents' real discovery
+node test/verify.mjs         # 151 checks: drives pi's real template engine and the package's discovery
 node test/verify-pi-e2e.mjs  # spawns a real `pi --mode rpc` and asks pi what commands it has
 ```
 
 `verify.mjs` is hermetic (it cannot mutate a real install) and covers templates, idempotency, `$ARGUMENTS`
 substitution through pi's own engine, shell-token protection, path rewriting, inlining, pruning and
 foreign-file protection, both safety valves, the global-context gating, and — through `jiti`, the loader pi
-uses — that all 35 agents load in **pi-subagents' own discovery** with the expected tools, thinking level and
-`excludeTools`, zero diagnostics. `verify-pi-e2e.mjs` covers what cannot be tested in-process: pi
+uses — that all 35 agents load with the expected built-in allowlist and `skills` flag.
+
+> **The discovery probe runs the package's own loader.** Files existing is not the claim; that the
+> package parses them into the intended configuration is. It imports
+> `@tintinweb/pi-subagents/dist/custom-agents.js` — the compiled output, because Node refuses to strip
+> types inside `node_modules` and the jiti the old probe used left with the old package — and calls
+> `loadCustomAgents()`. pi is a *peer* dependency, so the probe symlinks it into a temp `node_modules` and
+> runs the child with `--preserve-symlinks`; without that Node follows the symlink back to the package's
+> real path and finds no pi. It asserts that all 35 names come back, that `builtinToolNames` equals the
+> `tools:` line as written, that every agent inherits the skills catalogue, and that no agent reports a
+> locked reasoning level or a deny-list. It skips, rather than fails, where pi or the package is absent.
+
+`verify-pi-e2e.mjs` covers what cannot be tested in-process: pi
 auto-discovering the extension and `resources_discover → promptPaths` really registering native commands.
 Measured on a real install: `148 commands · 78 prompt templates · 72 gsd templates · 35 generated agents`.
 
@@ -273,26 +306,23 @@ Measured on a real install: `148 commands · 78 prompt templates · 72 gsd templ
   `/skill:<name>` and falls back to the matching `/gsd-<command>`.
 - **MCP and browser tools are not wired.** Generated agents declare **no** `mcp:` selectors — an unresolvable
   one aborts the whole spawn. The prompts point at GSD's CLI fallback (`ctx7 …`) instead.
-- **Foreground spawns of these agents fail outright.** A foreground child (`async: false`) never loads the
-  parent's ambient extensions, and every generated allowlist names extension tools — so pi-subagents
-  reports `requested unavailable child tools` and **the run dies with no output at all**; it does not
-  degrade to a missing-lookup report. Spawn these agents as background children (the default). GSD's own
-  `run_in_background: false` steps — its debug session manager — are the ones affected; if you need a
-  blocking spawn, give the agent the provider paths via `subagentOnlyExtensions` or `extensions` so the
-  child can load them itself.
+- **Extension tools need a background child.** A foreground child (`run_in_background: false`) does not load
+  the parent's ambient extensions, so the extension tools simply are not there — and since the generated
+  `tools:` line no longer names them, that now degrades to a missing tool rather than failing the spawn
+  outright, which is what the old package did. Spawn these agents as background children (the default).
 - **`AGENTS.md` needs `/reload`** in an already-open session.
 - **`reference` mode relies on the model following the read-first instruction** (the first item in the
   prompt). For absolute fidelity use `inline`; note that `inline` downgrades `${1:-default}` to
   `${1-default}` (2 occurrences in the tree). Agent bodies are not shell-token protected at all — a child's
   system prompt never goes through `substituteArgs`.
-- **`advertise` is not set** on any agent (pi-subagents' catalogue is capped at 16 entries / 12 KB, and the
-  commands already name the role to spawn).
+- **Nested spawning is off.** No agent may spawn another, so `gsd-debug-session-manager` — the one role GSD
+  gives a spawn tool — now reports the spawn it wanted instead of doing it.
 
 ## Repository layout
 
 ```
 gsd-slash-sync.js        the plugin (pi extension + CLI, single file, zero npm dependencies)
-test/verify.mjs          hermetic suite driving pi and pi-subagents
+test/verify.mjs          hermetic suite driving pi and the package's discovery
 test/verify-pi-e2e.mjs   end-to-end through a real pi process
 ```
 
