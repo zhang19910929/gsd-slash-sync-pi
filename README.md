@@ -3,6 +3,11 @@
 Sync **GSD Core's slash commands and subagents** into **pi (pi.dev)** — as native prompt templates and as
 **@tintinweb/pi-subagents** agent definitions — and re-sync them with one command whenever GSD Core updates.
 
+The subagent package is a real dependency, not a suggestion, so the sync **detects it** and writes the commands
+for the host they will run on: with it they dispatch GSD roles through `Agent(...)`; without it they say so and
+run each spawn step inline instead of naming a tool that is not there. Installing or removing the package flips
+the fingerprint, so the next sync rewrites the commands either way.
+
 ```
 /gsd-plan-phase  /gsd-execute-phase  /gsd-verify-work  /gsd-ship  …   72 commands
 gsd-planner · gsd-executor · gsd-verifier · gsd-code-reviewer · …     35 agents
@@ -53,9 +58,28 @@ pi auto-discovers `*.js` / `*.ts` in `extensions/`, so **no `settings.json` chan
 |---|---|---|
 | **pi** | everything | https://pi.dev |
 | A **GSD Core install for another runtime** | the source definitions — commands *and* agents | `npx -y @opengsd/gsd-core@latest --claude` |
-| **@tintinweb/pi-subagents** | the 35 agents; without it the generated files are inert | `pi install npm:@tintinweb/pi-subagents` |
+| **@tintinweb/pi-subagents** | **required for agent dispatch** — it registers the `Agent` tool and loads the 35 generated agents; without it they are inert | `pi install npm:@tintinweb/pi-subagents` |
 | **pi-web-access** | the web tools the research/audit agents use | `pi install npm:pi-web-access` |
 | **pi-mcp-adapter** (optional) | MCP servers you configure yourself | `pi install npm:pi-mcp-adapter`, then `/mcp setup` |
+
+### The pi-subagents dependency
+
+Everything in this repo still works without the package — what changes is what the generated commands *say*.
+
+| | `@tintinweb/pi-subagents` installed | not installed |
+|---|---|---|
+| `Agent` / `get_subagent_result` / `SubagentWorkflow` | exist | do not exist in any session |
+| `<gsd_subagent_dispatch>` block | the full `Agent({ subagent_type, prompt, description })` translation | `available="false"` — no spawn tool; run each spawn step yourself, never skip it |
+| `AGENTS.md` header | "does not reach subagents: the package builds children with `noContextFiles: true`" | "no `Agent` tool exists here; every role step runs inline" |
+| The 35 `gsd-*.md` agent files | loaded and dispatched | written but **inert** (nothing reads the directory) |
+| `node gsd-slash-sync.js status` | `subagents @tintinweb/pi-subagents installed` | `NOT installed` + a warning with the install command |
+
+The package is detected exactly like the other extension packages: it must be declared in `settings.json`'s
+`packages` **and** resolve under `<agentDir>/npm/node_modules/`. A declared-but-uninstalled entry counts as
+absent, so a half-finished `pi install` never produces templates that promise a tool the session lacks.
+
+Because its presence is in the sync fingerprint, the loop is closed: install the package, re-run `/gsd-sync`
+(or let the next session start do it), and the commands are rewritten with the full translation block.
 
 ## Where the source comes from
 
@@ -101,13 +125,27 @@ changed, or the plugin/mode/naming changed → regenerate and report
 session already has the new commands and agents.** Disable with `"autoSync": false` or
 `GSD_SLASH_SYNC_AUTO=off`.
 
-**Spawning agents.** GSD writes its spawn steps for Claude Code's `Agent` tool, and the installed package
-happens to have a tool by that same name — so the translation is mostly a parameter rename. Every generated
-command carries a `<gsd_subagent_dispatch>` block stating it: `Agent({ subagent_type: "gsd-planner", prompt:
-"…", description: "…" })`, where `description` is required by the schema; `run_in_background` is the same
-field with the same meaning; `TaskOutput` becomes `get_subagent_result({ agent_id })`; several spawns in one
-step become one `SubagentWorkflow` call. `subagent_type="general-purpose"` is already the package's own
-default agent, so it passes through unchanged.
+**Spawning agents — the two shapes.** GSD writes its spawn steps for Claude Code's `Agent` tool. When
+`@tintinweb/pi-subagents` is installed, the package happens to have a tool by that same name, so the translation
+is mostly a parameter rename, and every generated command carries a `<gsd_subagent_dispatch>` block stating it:
+`Agent({ subagent_type: "gsd-planner", prompt: "…", description: "…" })`, where `description` is required by
+the schema; `run_in_background` is the same field with the same meaning; `TaskOutput` becomes
+`get_subagent_result({ agent_id })`; several spawns in one step become one `SubagentWorkflow` call.
+`subagent_type="general-purpose"` is already the package's own default agent, so it passes through unchanged.
+
+When the package is **not** installed there is no `Agent` tool to call, so the same block is emitted with
+`available="false"` and says the opposite: do the step yourself in this session, using the converted
+`gsd-*.md` definition as the procedure, and never skip it. The failure this prevents is silent — a session told
+to dispatch a role it has no tool for does not error, it just drops the step.
+
+Two details of that block are deliberate rather than accidental:
+
+- **The translation block states the model rule instead of leaving it implied.** GSD's agents carry no `model:`,
+  so a child inherits the session's model and thinking level; the block says that, because an earlier version
+  claimed the opposite ("omit `model` so the agent's own default applies") about a default that does not exist.
+- **It tells the model to ignore `gsd_run query resolve-dispatch-type`.** On pi that query answers
+  `coder`/`explore`/`plan` — Kimi Code's built-ins, resolved from pi's `namedDispatch: false` descriptor —
+  and none of them exists here.
 
 ## Modes (default: `reference`)
 
@@ -177,7 +215,8 @@ this plugin writes. A project file with the same `name:` therefore overrides the
 **Commands.** Frontmatter → `description` / `argument-hint`; `<execution_context>` → a MUST-READ path list
 (reference) or inlined content (inline), with `~/.claude/…` paths mapped onto pi's tree. Every command gets a
 runtime contract stating: read the context first; `/gsd:<name>` means `/gsd-<name>`; **`AskUserQuestion` does
-not exist in pi** → ask in chat and wait; if a step names an agent, dispatch it, never run it inline.
+not exist in pi** → ask in chat and wait; and what to do about a step that names an agent — dispatch it when a
+spawn tool exists, otherwise run it in this session and say so, never skip it.
 `<runtime_note>` blocks (10 commands) are rewritten to the pi equivalent, shell positionals `"$@"` / `$1` are
 protected from pi's template substitution, and Claude-shaped paths (152 occurrences) are rewritten — GSD's
 `gsd_run` shim uses them to locate `gsd-tools.cjs`.
@@ -203,8 +242,25 @@ Three of those are deliberate omissions rather than gaps:
   and `codegraph_explore` callable while the generated `tools:` line named neither.
 - **`thinking:` is not emitted.** Frontmatter is *authoritative and locked* — "Agent tool parameters only
   fill fields the agent config leaves unspecified" — so pinning a level here would freeze it against the
-  caller. Left out it is `undefined`, which the package documents as *inherit*: a child follows the
-  session's current level and the caller can still override per call. GSD's per-role routing tier
+  caller. What the omission actually resolves to, though, is **not** inheritance — see below. GSD's per-role
+  routing tier (`bin/shared/model-catalog.json`, `config-defaults.manifest.json`) is still digested into the
+  sync fingerprint, but it is not turned into a locked level.
+- **…but the omitted field does not inherit the session's level. Measured, not inferred.** The package's
+  own README says an absent `thinking:` is *inherit*, and an earlier revision of this section repeated that.
+  The code does not do it: `agent-runner.ts` resolves `options.thinkingLevel ?? agentConfig?.thinking` and only
+  assigns it when truthy, so with both absent the child session is created with no level at all — and pi then
+  settles it the way it settles any *fresh* session: per-model override, else
+  `settings.defaultThinkingLevel`, else its hard-coded `"medium"`. Nothing anywhere reads the parent
+  session's current level.
+    Measured on the installed package: parent `PI_REASONING_LEVEL=high`, freshly dispatched child
+    `PI_REASONING_LEVEL=medium` — same model, same provider, different level. The model *is* inherited (the
+    parent's model runtime is handed to the child); the level is not.
+  So a GSD child runs at whatever `defaultThinkingLevel` says, not at whatever the session is set to. To make
+  children follow you, set `defaultThinkingLevel` in the agent settings; it is a static value, so an
+  interactive level change later will not propagate unless that change persists. Per-call, pass an explicit
+  `thinking` in `Agent()` — that path works and is what `agent-runner.ts:1004` honours.
+  This is worth reporting upstream: the documented behaviour and the implemented behaviour differ, and the
+  difference is silent.
   (`bin/shared/model-catalog.json`, `config-defaults.manifest.json`) is still digested into the sync
   fingerprint, but it is not turned into a locked level.
 - **`model:` is not emitted either — and nothing is being dropped.** GSD's own agent bundle carries no
@@ -222,10 +278,11 @@ register as separate `gsd-<role>.compact` agents.
 
 ## Global context (`AGENTS.md`)
 
-This file serves the **top-level session only**, and the section states that in as many words so nobody
-later assumes otherwise. Under the old pi-subagents it also reached children, via an `inheritGlobalContext`
-flag; that package is gone and the installed one hardcodes `noContextFiles: true`, so there is no setting
-that would put a context file in front of a child.
+This file serves the **top-level session only**, and its header says which world it is in rather than asserting
+a child boundary unconditionally. With `@tintinweb/pi-subagents` installed: the package builds child sessions
+with `noContextFiles: true` hardcoded, so no context file reaches a child by any setting — the old
+`inheritGlobalContext` flag went with the old package. Without the package there are no child sessions at all,
+and the header says that instead.
 
 Children get their guidance from their own prompt (the agent body) and from the task text they are handed —
 which is why the sync also writes a `<task_tool_routing>` block into every generated command, for the
@@ -236,11 +293,16 @@ The file is generated from the tools the host **actually** has, so it can never 
 | Section | Emitted when |
 |---|---|
 | `## Tool choice` — the job → tool table, emitted per installed tool | any indexed tool (`@ff-labs/pi-fff`, `@izhimu/pi-codegraph`, `pi-hashline-edit-pro`) |
-| `## Build output is not source` — never search `target/`, `node_modules/`, `dist/`, `.git/` | `@ff-labs/pi-fff` |
+| `## Build output is not source` — never search `target/`, `node_modules/`, `dist/`, `.git/` | any higher-tier tool — the same gate as `## Tool choice` |
 | `## Structural questions` — use `codegraph_explore` | `@izhimu/pi-codegraph` |
 | `## Editing` — use `anchor_grep` / `replace` / `insert`, not `sed -i` | `pi-hashline-edit-pro` |
 | `## Web lookups` — `web_search` / `fetch_content` | `pi-web-access` |
 
+The routing table has three consumers — `## Tool choice` and `## Build output is not source` here, the
+`before_agent_start` turn message, and the `<task_tool_routing>` block inside every generated command — and
+they all gate on the same condition (at least one higher-tier tool installed), so they appear together or not
+at all. The `ffgrep`/`fffind` sentence inside the build-output paragraph is the only part that depends on those
+two packages, and it is dropped when they are absent rather than naming a tool the host lacks.
 A file without the generator marker is the user's and is **never overwritten** (reported as `kept`); with no
 packages detected the file is `skipped` rather than written empty. It is a *context file*, so an open session
 needs **`/reload`** before it sees new guidance.
@@ -283,14 +345,20 @@ Skills need no equivalent change: they are not registry entries, pi formats them
 ## Verification
 
 ```bash
-node test/verify.mjs         # 151 checks: drives pi's real template engine and the package's discovery
+node test/verify.mjs         # 172 checks: drives pi's real template engine and the package's discovery
 node test/verify-pi-e2e.mjs  # spawns a real `pi --mode rpc` and asks pi what commands it has
 ```
 
 `verify.mjs` is hermetic (it cannot mutate a real install) and covers templates, idempotency, `$ARGUMENTS`
 substitution through pi's own engine, shell-token protection, path rewriting, inlining, pruning and
-foreign-file protection, both safety valves, the global-context gating, and — through `jiti`, the loader pi
-uses — that all 35 agents load with the expected built-in allowlist and `skills` flag.
+foreign-file protection, both safety valves, the global-context gating, and — by running the package's own
+loader — that all 35 agents load with the expected built-in allowlist and `skills` flag.
+
+The spawn-package split is covered on **both** hosts rather than only the one this machine happens to be: the
+suite builds a synthetic agent dir with the package installed and another that declares it without installing it,
+and asserts the resulting `<gsd_subagent_dispatch>` block, the `AGENTS.md` header, the report warning and the
+fingerprint on each. The real agent dir's output is then checked against the real detection, so the suite is
+honest on a host without the package.
 
 > **The discovery probe runs the package's own loader.** Files existing is not the claim; that the
 > package parses them into the intended configuration is. It imports
@@ -310,6 +378,11 @@ Measured on a real install: `148 commands · 78 prompt templates · 72 gsd templ
 
 - **GSD's skills are not synced.** `ns-*` style commands are skill routers; the contract points at
   `/skill:<name>` and falls back to the matching `/gsd-<command>`.
+- **The spawn-package check is install-layout based.** Like every other extension detection here it requires the
+  package to resolve under `<agentDir>/npm/node_modules/`, which is what `pi install` produces. A pi-subagents
+  loaded from anywhere else — a hand-edited path entry, a vendored copy — reads as absent, so the generated
+  commands fall back to inline work even though an `Agent` tool may exist. Installing it the documented way (or
+  re-running the sync once it resolves) restores the dispatch block.
 - **MCP and browser tools are not wired.** Generated agents declare **no** `mcp:` selectors — an unresolvable
   one aborts the whole spawn. The prompts point at GSD's CLI fallback (`ctx7 …`) instead.
 - **Extension tools need a background child.** A foreground child (`run_in_background: false`) does not load
