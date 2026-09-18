@@ -789,6 +789,22 @@ if (fs.existsSync(jitiPath) && fs.existsSync(piSubagentsDir)) {
     check('pi-subagents reads the excludeTools mapping', (ours.find((a) => a.name === 'gsd-verifier') || {}).excludeTools?.join(',') === 'edit');
     const manager = ours.find((a) => a.name === 'gsd-debug-session-manager');
     check('pi-subagents reads the nested-fanout flag', manager && manager.allowNestedSubagents === true);
+    // The global-context guidance depends on pi-subagents actually honouring this
+    // field, not merely on us writing it. `thinking` and `excludeTools` already
+    // have this kind of round-trip assertion; without one here, a pi-subagents
+    // change that stops reading the field would silently disable the guidance for
+    // every child while the generated files still looked correct.
+    check(
+      'pi-subagents reads the global-context inheritance flag',
+      // Scoped to the agents we generated: this discovery root also holds the
+      // suite's own foreign fixtures, which carry no such flag by design.
+      (() => {
+        const byName = new Map(ours.map((a) => [a.name, a]));
+        const missing = generated.filter((n) => (byName.get(n) || {}).inheritGlobalContext !== true);
+        return generated.length === 35 && missing.length === 0;
+      })(),
+      generated.filter((n) => ((ours.find((a) => a.name === n) || {}).inheritGlobalContext) !== true).join(', '),
+    );
     check('pi-subagents accepts every generated agent with no diagnostics', found.agentDiagnostics.filter((d) => (d.filePath || '').startsWith(agentsDir)).length === 0, JSON.stringify(found.agentDiagnostics.filter((d) => (d.filePath || '').startsWith(agentsDir))));
   } catch (err) {
     check('pi-subagents discovery probe', false, err && err.message ? err.message : String(err));
