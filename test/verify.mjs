@@ -75,6 +75,11 @@ const realAgentsBefore = realAgentsDirSnapshot();
 const realConfigBefore = fs.existsSync(path.join(agentDir, _internals.CONFIG_FILE))
   ? fs.readFileSync(path.join(agentDir, _internals.CONFIG_FILE), 'utf8')
   : null;
+// Same guard for the global context file the sync generates.
+const realGlobalContext = path.join(agentDir, _internals.GLOBAL_CONTEXT_FILE);
+const realGlobalContextBefore = fs.existsSync(realGlobalContext)
+  ? fs.readFileSync(realGlobalContext, 'utf8')
+  : null;
 
 let passed = 0;
 const failures = [];
@@ -93,6 +98,17 @@ console.log(`  plugin    ${pluginPath}`);
 console.log(`  pi engine ${PI_PKG}`);
 console.log(`  agent dir ${agentDir}`);
 console.log('');
+
+// The suite syncs against the REAL agent dir so the host-tool detection is
+// genuine, which also means the global-context writer would target the real
+// ~/.pi/agent/AGENTS.md. Section 11 asserts the suite does not mutate the real
+// install, so it is disabled here; the writer itself is exercised below against
+// temp dirs, and the env switch is asserted to work.
+process.env.GSD_SLASH_SYNC_NO_GLOBAL_CONTEXT = '1';
+check(
+  'the env switch disables the global-context write',
+  _internals.resolveOptions({}, {}).syncGlobalContext === false,
+);
 
 // ── 1. reference-mode install as it ships ────────────────────────────────────
 console.log('1) reference mode (installed output)');
@@ -498,68 +514,77 @@ check(
     /pi web tools/.test(agentSources.get('gsd-planner.md')),
 );
 
-// ── indexed-search guidance ────────────────────────────────────────────────
-// Every GSD body still says plain `grep`/`find`; an unbounded recursive grep
-// from one of them walked this project's 35 GB target/ tree and had to be
-// killed. The block is content-driven (needs the tool in the allowlist) and
-// self-retiring (skipped once upstream names the indexed tools).
-const probeAgent = (tools, body) =>
-  _internals.convertAgent(
-    `---\nname: gsd-search-probe\ndescription: probe\ntools: ${tools}\n---\n${body}\n`,
-    'gsd-search-probe',
-    { ..._internals.resolveOptions({}, {}), srcDir: here, coreRoot: path.join(agentDir, 'gsd-core'), version: 'test', roster: [], rosterPattern: null, extensionTools: _internals.SEARCH_GUIDANCE_TOOLS, webToolsAvailable: false },
-  );
-
+// ── global context file ────────────────────────────────────────────────────
+// The guidance moved out of the 35 agent bodies and into the one artifact both
+// sides of the child boundary can see. It is generated from the tools actually
+// detected, so it can never advertise a tool this host does not have.
+const gcAll = _internals.buildGlobalContext(extensionTools, webTools);
 check(
-  'indexed-search guidance is injected into every generated agent',
-  [...agentSources.keys()].every((n) => {
-    const text = fs.readFileSync(path.join(agentsTmp, n), 'utf8');
-    return text.includes(`<${_internals.SEARCH_GUIDANCE_TAG}>`);
-  }),
+  'the generated context names exactly the tools the host provides',
+  ['ffgrep', 'codegraph_explore', 'replace'].every((t) => gcAll.includes(t)) &&
+    !(extensionTools.includes('web_search') && !webTools) &&
+    /## Searching/.test(gcAll),
 );
 check(
-  'the injected block names the indexed tools the allowlist actually grants',
-  (() => {
-    const c = probeAgent('Read, Grep', 'plain body');
-    return _internals.SEARCH_GUIDANCE_TOOLS.every((t) => c.content.includes(t));
-  })(),
+  'the guidance bounds recursive searches rather than just suggesting the tools',
+  gcAll.includes('--exclude-dir=target') && gcAll.includes('--exclude-dir=node_modules'),
 );
 check(
-  'the injected block bounds recursive shell searches',
+  'no section is emitted for a tool the host lacks',
   (() => {
-    const c = probeAgent('Read, Grep', 'plain body');
-    return c.content.includes('--exclude-dir=target') && c.content.includes('--exclude-dir=node_modules');
-  })(),
-);
-check(
-  'no block is injected when the allowlist has no indexed search tool',
-  (() => {
-    const c = _internals.convertAgent(
-      '---\nname: gsd-nosearch\ndescription: probe\ntools: Read\n---\nbody\n',
-      'gsd-nosearch',
-      { ..._internals.resolveOptions({}, {}), srcDir: here, coreRoot: path.join(agentDir, 'gsd-core'), version: 'test', roster: [], rosterPattern: null, extensionTools: [], webToolsAvailable: false },
-    );
-    return !c.content.includes(_internals.SEARCH_GUIDANCE_TAG);
-  })(),
-);
-check(
-  'injection is idempotent and self-retiring',
-  (() => {
-    const once = _internals.injectSearchGuidance('body', ['ffgrep']);
-    const twice = _internals.injectSearchGuidance(once.text, ['ffgrep']);
-    const already = _internals.injectSearchGuidance('body — use ffgrep instead of grep', ['ffgrep']);
+    const onlySearch = _internals.buildGlobalContext(['ffgrep', 'fffind'], false);
+    const none = _internals.buildGlobalContext([], false);
     return (
-      once.injected === true &&
-      twice.injected === false &&
-      twice.text === once.text &&
-      already.injected === false &&
-      already.text === 'body — use ffgrep instead of grep'
+      onlySearch.includes('ffgrep') &&
+      !onlySearch.includes('codegraph_explore') &&
+      !/## Editing/.test(onlySearch) &&
+      !/## Structural/.test(onlySearch) &&
+      none === ''
     );
   })(),
 );
 check(
-  'searchGuidanceBlock returns an empty string with no indexed tool available',
-  _internals.searchGuidanceBlock(['read', 'bash']) === '' && _internals.searchGuidanceBlock(['ffgrep']).includes('ffgrep'),
+  'every generated agent declares inheritGlobalContext',
+  agentFiles.every((f) => /^inheritGlobalContext: true$/m.test(fmOf(f))),
+  agentFiles.filter((f) => !/^inheritGlobalContext: true$/m.test(fmOf(f))).join(', '),
+);
+check(
+  'the agent body no longer carries the guidance prose',
+  [...agentSources.keys()].every((n) => !fs.readFileSync(path.join(agentsTmp, n), 'utf8').includes('gsd_pi_search')),
+);
+check(
+  'sync writes AGENTS.md and is idempotent on re-run',
+  (() => {
+    const tmpAgentDir = path.join(tmpRoot, 'gc-agent-dir');
+    fs.mkdirSync(tmpAgentDir, { recursive: true });
+    const gcOpts = { ..._internals.resolveOptions({ agentDir: tmpAgentDir }, {}), agentDir: tmpAgentDir, dryRun: false };
+    const first = _internals.syncGlobalContext(gcOpts, ['ffgrep', 'codegraph_explore'], false);
+    const target = path.join(tmpAgentDir, _internals.GLOBAL_CONTEXT_FILE);
+    const second = _internals.syncGlobalContext(gcOpts, ['ffgrep', 'codegraph_explore'], false);
+    return first.status === 'added' && second.status === 'unchanged' && fs.readFileSync(target, 'utf8').includes('ffgrep');
+  })(),
+);
+check(
+  'a hand-written AGENTS.md is never overwritten',
+  (() => {
+    const tmpAgentDir = path.join(tmpRoot, 'gc-foreign-dir');
+    fs.mkdirSync(tmpAgentDir, { recursive: true });
+    const target = path.join(tmpAgentDir, _internals.GLOBAL_CONTEXT_FILE);
+    fs.writeFileSync(target, '# mine\n');
+    const gcOpts = { ..._internals.resolveOptions({ agentDir: tmpAgentDir }, {}), agentDir: tmpAgentDir, dryRun: false };
+    const res = _internals.syncGlobalContext(gcOpts, ['ffgrep'], false);
+    return res.status === 'kept' && fs.readFileSync(target, 'utf8') === '# mine\n';
+  })(),
+);
+check(
+  'dry-run reports the write without touching the file',
+  (() => {
+    const tmpAgentDir = path.join(tmpRoot, 'gc-dry-dir');
+    fs.mkdirSync(tmpAgentDir, { recursive: true });
+    const gcOpts = { ..._internals.resolveOptions({ agentDir: tmpAgentDir }, {}), agentDir: tmpAgentDir, dryRun: true };
+    const res = _internals.syncGlobalContext(gcOpts, ['ffgrep'], false);
+    return res.status === 'added' && !fs.existsSync(path.join(tmpAgentDir, _internals.GLOBAL_CONTEXT_FILE));
+  })(),
 );
 
 // ── install-time effort resolution ─────────────────────────────────────────
@@ -781,6 +806,11 @@ if (fs.existsSync(jitiPath) && fs.existsSync(piSubagentsDir)) {
 console.log('\n11) hygiene');
 const realConfig = path.join(agentDir, _internals.CONFIG_FILE);
 // Compare against the snapshot taken before the suite ran (see realConfigBefore).
+check(
+  'suite left the global context file untouched',
+  realGlobalContextBefore === (fs.existsSync(realGlobalContext) ? fs.readFileSync(realGlobalContext, 'utf8') : null),
+  `AGENTS.md changed during the run`,
+);
 check(
   'suite left the user config file untouched',
   realConfigBefore === (fs.existsSync(realConfig) ? fs.readFileSync(realConfig, 'utf8') : null),
