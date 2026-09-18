@@ -102,7 +102,7 @@ const GENERATOR = 'gsd-slash-sync';
 // Bump on ANY change to the conversion output (not just when the CLI surface
 // changes): the state file records this string and a mismatch forces a re-sync,
 // so an upgraded plugin never leaves stale templates behind.
-const GENERATOR_VERSION = '1.8.0';
+const GENERATOR_VERSION = '1.8.1';
 const STATE_FILE = '.gsd-slash-sync-state.json';
 // The agent set keeps its own state file: the two artifacts are written into
 // different directories and can be redirected independently, so each one carries
@@ -1669,8 +1669,9 @@ function subagentDispatchBlock(agents, ctx) {
     '  \u2022 `run_in_background: false` \u2192 `run_in_background: false` (block and wait); `true` or absent \u2192 leave it off (background is the default).',
   );
   core.push(
-    '  \u2022 `model="{PLANNER_MODEL}"` and friends are unresolved placeholders here \u2014 omit `model` so the agent\u2019s ' +
-      'own default applies, or pass an exact `provider/id`.',
+    '  \u2022 `model="{PLANNER_MODEL}"` and friends are unresolved placeholders here \u2014 drop the argument. GSD\u2019s ' +
+      'agents carry no `model:` of their own, so a child **inherits this session\u2019s model and thinking level**; that is ' +
+      'the point, not a gap. Pass an exact `provider/id` (or an explicit `thinking`) only when you deliberately want one child to differ.',
   );
   core.push('  \u2022 `subagent_type="general-purpose"` \u2192 `subagent_type: "general-purpose"` (the package\u2019s own default agent).');
   core.push(

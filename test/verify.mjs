@@ -783,6 +783,19 @@ const dispatchTemplate = fs.readFileSync(path.join(tmpRoot, 'agents-cmds', 'gsd-
 check('commands carry the Agent dispatch translation', dispatchTemplate.includes('Agent({ subagent_type: "gsd-planner"'));
 check('the translation states the required description field', dispatchTemplate.includes('description:'));
 check('the translation covers background/foreground', dispatchTemplate.includes('`run_in_background: false`'));
+// The decision the dispatch block has to state, and the claim it must not make again: the
+// generated agents carry no `model:`, so "the agent's own default" is not a thing that exists.
+// See README §8.1 — children inherit the session's model and thinking level.
+check(
+  'the translation says a child inherits the session model',
+  dispatchTemplate.includes('inherits this session') && dispatchTemplate.includes('thinking level'),
+  dispatchTemplate.split('\n').find((l) => l.includes('PLANNER_MODEL')) || 'no PLANNER_MODEL line',
+);
+check(
+  'the translation no longer invents a per-agent model default',
+  !dispatchTemplate.includes('own default applies'),
+  'the stale "omit `model` so the agent\u2019s own default applies" wording is back',
+);
 check('the translation names the result-retrieval tool', dispatchTemplate.includes('get_subagent_result'));
 check('the translation names the parallel form', dispatchTemplate.includes('SubagentWorkflow'));
 check('the translation warns about resolve-dispatch-type', dispatchTemplate.includes('resolve-dispatch-type'));
