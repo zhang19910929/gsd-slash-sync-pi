@@ -102,7 +102,7 @@ const GENERATOR = 'gsd-slash-sync';
 // Bump on ANY change to the conversion output (not just when the CLI surface
 // changes): the state file records this string and a mismatch forces a re-sync,
 // so an upgraded plugin never leaves stale templates behind.
-const GENERATOR_VERSION = '1.4.0';
+const GENERATOR_VERSION = '1.5.0';
 const STATE_FILE = '.gsd-slash-sync-state.json';
 // The agent set keeps its own state file: the two artifacts are written into
 // different directories and can be redirected independently, so each one carries
@@ -1196,18 +1196,57 @@ function resolveAgentEffort(name, data, catalog) {
 /** Tool package → the guidance paragraph it enables. Order is the emit order. */
 const GLOBAL_CONTEXT_SECTIONS = Object.freeze([
   {
+    // Cross-package on purpose: the table is only useful read as a whole, and a
+    // row is emitted only for a tool this host actually has. The any-of gate
+    // hands render() exactly the present subset, so the table can never name a
+    // tool that is not installed.
+    tools: ['ffgrep', 'fffind', 'codegraph_explore', 'anchor_grep'],
+    render: (tools) => {
+      const has = (name) => tools.includes(name);
+      const rows = [];
+      if (has('fffind')) rows.push(['find files by name or path', '`fffind`', '`find`, `ls -R`']);
+      if (has('ffgrep')) rows.push(['search file contents', '`ffgrep`', '`grep -r`, `rg`']);
+      if (has('anchor_grep')) {
+        rows.push(['read a line range of a file', '`anchor_grep`, then `read`', '`cat`, `sed -n`, `head`']);
+      }
+      if (has('codegraph_explore')) {
+        rows.push(['what calls X, what a change affects', '`codegraph_explore`', 'a chain of greps and reads']);
+      }
+      return [
+        '## Tool choice',
+        '',
+        'When a higher-tier tool exists for a job, use it instead of the shell',
+        'equivalent — same answer, a fraction of the cost:',
+        '',
+        '| job | use | not |',
+        '| --- | --- | --- |',
+        ...rows.map((row) => `| ${row[0]} | ${row[1]} | ${row[2]} |`),
+        '',
+        'A job with no row above has no higher-tier tool installed here; use the',
+        'shell for it, and bound the search.',
+        '',
+      ];
+    },
+  },
+  {
     tools: ['ffgrep', 'fffind'],
     render: (tools) => [
-      '## Searching',
+      '## Build output is not source',
       '',
-      `Prefer the indexed search tools over recursive shell walks: ${tools.map((t) => `\`${t}\``).join(', ')}.`,
-      'They skip build output by design, so they are faster and cheaper than a',
-      'recursive `grep`/`find` over the same tree.',
+      'Never search, list, or read inside build and dependency directories:',
+      '`target/`, `node_modules/`, `dist/`, `.git/`, and anything `.gitignore`',
+      'already covers. They are not source, and nothing in them answers your',
+      'question.',
       '',
-      'If you do run a recursive search, bound it — this is a real failure mode, not',
-      'a style preference. A bare `grep -rn <pattern> .` in a Rust or Node project',
-      'walks tens of gigabytes of build artifacts and can sit at a full core for',
-      'minutes without producing one usable line:',
+      'This is a failure mode, not a style preference. A bare `grep -rln <pattern>',
+      '<dir>/` in a Rust or Node project walks tens of gigabytes across hundreds of',
+      'thousands of files, pins one core for minutes, and returns nothing usable.',
+      'Measured on a 35 GB Rust `target/`: four minutes at 88% CPU before it had to',
+      `be killed. The indexed tools (${tools.map((t) => `\`${t}\``).join(', ')}) skip these`,
+      'directories by design, which is one more reason to reach for them first.',
+      '',
+      'If you genuinely need a recursive shell search, bound it. This is the',
+      'minimum, not a suggestion:',
       '',
       '```',
       'grep -rn <pattern> <dir> \\',
@@ -1807,6 +1846,42 @@ function agentRuntimeContract({ name, ctx, mode, refs }) {
   } else if (mode === 'inline' && refs.length > 0) {
     item('The files this agent references are inlined below — treat them as part of your instructions.');
   }
+  // Tool routing, stated in the agent's own prompt rather than only in the
+  // inherited global context. Measured on this project's phase-5 runs: with the
+  // same names in the allowlist and the same paragraph in AGENTS.md, four review
+  // agents made 153 tool calls and used an indexed tool zero times — they ran
+  // `grep`/`rg` inside `bash` instead. A task prompt that named the tools produced
+  // calls immediately. This block puts that wording where the agent's body is.
+  // Rows appear only for tools the host actually has, so it can never name one
+  // that cannot resolve.
+  const routingTools = Array.isArray(ctx.extensionTools) ? ctx.extensionTools : [];
+  const hasTool = (tool) => routingTools.includes(tool);
+  const routingRows = [];
+  if (hasTool('ffgrep')) {
+    routingRows.push('   | search file contents | `ffgrep` | `grep -r`, `rg` |');
+  }
+  if (hasTool('fffind')) {
+    routingRows.push('   | find files by name or path | `fffind` | `find`, `ls -R` |');
+  }
+  if (hasTool('codegraph_explore')) {
+    routingRows.push('   | what calls X, what a change affects | `codegraph_explore` | a chain of greps |');
+  }
+  if (hasTool('anchor_grep')) {
+    routingRows.push('   | read a line range | `anchor_grep`, then `read` | `cat`, `sed -n`, `head` |');
+  }
+  if (routingRows.length > 0) {
+    item('Tool routing — use the higher-tier tool, do not fall back to its shell equivalent:');
+    lines.push('   | job | use | not |');
+    lines.push('   | --- | --- | --- |');
+    lines.push(...routingRows);
+  }
+  item(
+    'Never search, list, or read inside build and dependency directories — `target/`, ' +
+      '`node_modules/`, `dist/`, `.git/` are build output, not source, and nothing in them answers ' +
+      'your question. An unbounded `grep -rln <pattern> <dir>/` there walks tens of gigabytes, ' +
+      'pins a core for minutes, and returns nothing usable. If you must run a recursive shell ' +
+      'search, pass `--exclude-dir` and `--include`.',
+  );
   item(
     'Slash commands in pi use the hyphen form: `/gsd-<name>`. Wherever GSD text says `/gsd:<name>`, use `/gsd-<name>`.',
   );

@@ -523,7 +523,11 @@ check(
   'the generated context names exactly the tools the host provides',
   ['ffgrep', 'codegraph_explore', 'replace'].every((t) => gcAll.includes(t)) &&
     !(extensionTools.includes('web_search') && !webTools) &&
-    /## Searching/.test(gcAll),
+    /## Tool choice/.test(gcAll) &&
+    /## Build output is not source/.test(gcAll) &&
+    // The substitution table is the point of the section: every row must offer a
+    // higher-tier tool against a named shell fallback.
+    ['| job | use | not |', '`ffgrep`', '`grep -r`'].every((s) => gcAll.includes(s)),
 );
 check(
   'the guidance bounds recursive searches rather than just suggesting the tools',
@@ -537,6 +541,7 @@ check(
     return (
       onlySearch.includes('ffgrep') &&
       !onlySearch.includes('codegraph_explore') &&
+      !onlySearch.includes('anchor_grep') &&
       !/## Editing/.test(onlySearch) &&
       !/## Structural/.test(onlySearch) &&
       none === ''
