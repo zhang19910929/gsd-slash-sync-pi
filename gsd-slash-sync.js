@@ -2745,6 +2745,13 @@ function formatReport(report) {
       '  hint        pi-subagents picks the agents up on its next run; a session that is already open can use ' +
         '/reload (or restart pi) to see them in {action:"list"}.',
     );
+    // AGENTS.md is a context file, so an open session needs /reload before the
+    // guidance reaches the model. Without saying so, a regenerated file looks
+    // like it took effect when it has not.
+    // 'kept' means the file did not change either, so it needs no reload.
+    if (report.globalContext.status === 'added' || report.globalContext.status === 'updated') {
+      L.push('  hint        /reload also re-reads AGENTS.md — until then an open session keeps the previous guidance.');
+    }
   }
   return L.join('\n');
 }
