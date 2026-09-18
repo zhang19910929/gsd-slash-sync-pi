@@ -813,11 +813,17 @@ const AGENT_TOOL_MAP = Object.freeze({
  */
 const HOST_EXTENSION_TOOLS = Object.freeze({
   '@izhimu/pi-codegraph': ['codegraph_explore'],
-  // `fff-multi-grep` is deliberately absent: pi-fff registers it only when
+  // Only tools a package registers unconditionally may be listed, and the rule is
+  // a policy, not just a workaround: a package that keeps a capability behind an
+  // opt-in has decided its default posture, and the sync does not overrule that on
+  // the operator's behalf.
+  //
+  // `fff-multi-grep` is the worked example. pi-fff registers it only when
   // `PI_FFF_MULTIGREP=1`, so on a default install the name does not resolve — and a
   // strict allowlist that names an unregistered tool fails the whole spawn
-  // (`requested unavailable child tools`), it does not degrade. Only tools a package
-  // registers unconditionally may be listed here.
+  // (`requested unavailable child tools`), it does not degrade. The name is absent
+  // here because the package keeps it closed, not because it is hard to reach: even
+  // with the variable set, this table stays as it is.
   '@ff-labs/pi-fff': ['ffgrep', 'fffind'],
   'pi-hashline-edit-pro': ['anchor_grep', 'replace', 'insert', 'undo_last_change'],
 });

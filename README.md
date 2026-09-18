@@ -240,7 +240,10 @@ the package resolves under `<agentDir>/npm/node_modules`:
 **Only tools a package registers unconditionally may be listed.** A strict allowlist that names an
 unregistered tool does not degrade — pi-subagents fails the entire spawn with `requested unavailable child
 tools`. pi-fff is the worked example: it registers `fff-multi-grep` only when `PI_FFF_MULTIGREP=1`, so
-naming it broke every one of the 35 agents on a default install.
+naming it broke every one of the 35 agents on a default install. That is a policy, not just a workaround: a
+package that keeps a capability behind an opt-in has chosen its default posture, so the sync does not
+overrule it by turning the opt-in on. `fff-multi-grep` stays out of the table even with
+`PI_FFF_MULTIGREP=1` set.
 
 Deliberately **not** merged, because they change what a child can *do* to the machine or session rather than
 what it can read: `bg_*` / `fusion_*`, `subagent` / `contact_supervisor` (except agents GSD marks
