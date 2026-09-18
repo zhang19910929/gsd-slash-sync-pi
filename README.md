@@ -207,6 +207,12 @@ Three of those are deliberate omissions rather than gaps:
   session's current level and the caller can still override per call. GSD's per-role routing tier
   (`bin/shared/model-catalog.json`, `config-defaults.manifest.json`) is still digested into the sync
   fingerprint, but it is not turned into a locked level.
+- **`model:` is not emitted either — and nothing is being dropped.** GSD's own agent bundle carries no
+  `model:` at all (0 of the 64 sources), so per-agent models only ever existed as the routing tiers in
+  `bin/shared/model-catalog.json`. Those are not turned into a per-agent model. Every GSD child
+  **inherits the session's model and thinking level**; that is the requested behaviour, not a gap. The
+  generated dispatch block now says so, because it used to claim the opposite — "omit `model` so the
+  agent's own default applies" — describing a default that does not exist anywhere in the tree.
 - **No `inheritProjectContext` / `inheritGlobalContext`.** The package builds child sessions with
   `noContextFiles: true` hardcoded, so no context file reaches a child by any setting. `inherit_context` is
   a different feature — it forks the *parent conversation* — and is not what GSD's workers want.
