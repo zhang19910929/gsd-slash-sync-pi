@@ -1027,6 +1027,95 @@ function effortCatalogFingerprint(coreRoot, srcDir) {
   return sha256(found.map((p) => readIfExists(p) || '').join('\u0000'));
 }
 
+// ── Read-only deny-list ──────────────────────────────────────────────────────
+// Like `effort:`, `disallowedTools:` is not in the pristine gsd-core agent
+// bundle — GSD injects it at install time. The authoritative table lives in the
+// core bundle as an exported constant:
+//
+//   bin/lib/runtime-artifact-conversion.cjs
+//     READONLY_AGENT_DISALLOWED_TOOLS
+//       Group A (deny Write,Edit,MultiEdit): plan/integration/ui checkers
+//       Group B (deny Edit,MultiEdit):       verifier + auditors, which still
+//                                            Write their report file
+//       gsd-nyquist-auditor is deliberately absent: it legitimately uses
+//       Write and Edit to create and patch test files.
+//
+// Today the generated allowlists already exclude those tools, because the source
+// `tools:` lines were authored to match. Reading the table anyway matches what
+// GSD's own installer does and keeps the discipline enforced if an upstream
+// `tools:` edit ever adds a writer tool back to a checker.
+const READONLY_DENY_MODULE = path.join('bin', 'lib', 'runtime-artifact-conversion.cjs');
+const _readonlyDenyCache = new Map();
+
+/**
+ * Load GSD's read-only deny-list, mapped to pi tool names.
+ * @param {string|undefined} coreRoot
+ * @param {string|undefined} srcDir
+ * @returns {{ map: Record<string,string[]>, path: string|null }}
+ */
+function loadReadonlyDenyList(coreRoot, srcDir) {
+  const bases = [coreRoot, srcDir ? path.resolve(srcDir, '..') : null, srcDir];
+  for (const base of bases) {
+    if (!base) continue;
+    const modulePath = path.join(base, READONLY_DENY_MODULE);
+    if (!isFile(modulePath)) continue;
+    const hit = _readonlyDenyCache.get(modulePath);
+    if (hit) return hit;
+    try {
+      // eslint-disable-next-line global-require -- the core bundle is resolved at runtime
+      const table = require(modulePath).READONLY_AGENT_DISALLOWED_TOOLS;
+      if (!table || typeof table !== 'object') break;
+      const map = {};
+      for (const [agent, raw] of Object.entries(table)) {
+        // Same mapping as the source `disallowedTools:` path: MultiEdit has no pi
+        // equivalent, so it drops out rather than entering the allowlist as a name
+        // pi-subagents would reject.
+        const names = [];
+        for (const name of String(raw).split(',')) {
+          const mapped = AGENT_TOOL_MAP[name.trim().toLowerCase()];
+          if (mapped && !names.includes(mapped)) names.push(mapped);
+        }
+        if (names.length) map[agent] = names;
+      }
+      const result = { map, path: modulePath };
+      _readonlyDenyCache.set(modulePath, result);
+      return result;
+    } catch {
+      break;
+    }
+  }
+  return { map: {}, path: null };
+}
+
+/**
+ * Fingerprint-able digest of the derived deny-list. Hashes the mapped table
+ * rather than the module file: the module is thousands of lines of unrelated
+ * installer code, and a change anywhere in it must not force a re-sync.
+ * @param {string|undefined} coreRoot
+ * @param {string|undefined} srcDir
+ * @returns {string} hex digest, or '' when the table is unavailable
+ */
+function readonlyDenyFingerprint(coreRoot, srcDir) {
+  const loaded = loadReadonlyDenyList(coreRoot, srcDir);
+  if (!loaded.path) return '';
+  return sha256(JSON.stringify(loaded.map));
+}
+
+/**
+ * Union the source `disallowedTools:` mapping with GSD's install-time deny-list.
+ * @param {string[]} declared from mapAgentDisallowed
+ * @param {string[]|undefined} fromCore
+ * @returns {string[]}
+ */
+function mergeExcludeTools(declared, fromCore) {
+  const out = Array.isArray(declared) ? [...declared] : [];
+  for (const tool of Array.isArray(fromCore) ? fromCore : []) {
+    if (!out.includes(tool)) out.push(tool);
+  }
+  return out;
+}
+
+
 /**
  * Resolve an agent's pi thinking level: an explicit source `effort:` wins, then
  * GSD's routing-tier catalog.
@@ -1665,7 +1754,12 @@ function convertAgent(raw, name, ctx) {
   // `gsd-intel-updater` walks project `skills/` directories). They still need pi's
   // skills catalogue to work the same way.
   if (!caps.skill && /(\/skill:|\bskill\(|skills?\/|SKILL\.md|skill to invoke)/i.test(body)) caps.skill = true;
-  const excludeTools = mapAgentDisallowed(data, lists);
+  // `disallowedTools:` is likewise installed by GSD, not declared in the pristine
+  // bundle — union it with anything the source does declare.
+  const excludeTools = mergeExcludeTools(
+    mapAgentDisallowed(data, lists),
+    loadReadonlyDenyList(ctx.coreRoot, ctx.srcDir).map[name],
+  );
   // `effort:` is absent from the pristine gsd-core bundle — GSD injects it at
   // install time from its routing-tier tables, so resolve through those too.
   const effortCatalog = loadEffortCatalog(ctx.coreRoot, ctx.srcDir);
@@ -1856,6 +1950,9 @@ function syncAgents(opts, ctx, source, agentSource, report) {
     // Key order is load-bearing: this object is hashed with JSON.stringify and
     // status() rebuilds it, so both sides must insert the key in the same slot.
     effortCatalog: effortCatalogFingerprint(ctx.coreRoot, agentSource.dir),
+    // The read-only deny-list is derived from a core table the same way, and it
+    // changes `excludeTools:` — so it belongs in the fingerprint too.
+    readonlyDeny: readonlyDenyFingerprint(ctx.coreRoot, agentSource.dir),
     version: ctx.version,
     agents: [],
   };
@@ -2380,6 +2477,8 @@ function status(flags = {}) {
         // Same digest syncAgents uses — the thinking level comes from these
         // tables, so a re-tier upstream must flip status to STALE.
         effortCatalog: effortCatalogFingerprint(source.coreRoot || path.resolve(source.dir, '..', '..'), agentSource.dir),
+        // Same digest syncAgents uses — this one drives `excludeTools:`.
+        readonlyDeny: readonlyDenyFingerprint(source.coreRoot || path.resolve(source.dir, '..', '..'), agentSource.dir),
         version: source.version,
         agents: agentParts,
       });
@@ -2890,6 +2989,10 @@ module.exports._internals = {
   loadEffortCatalog,
   resolveAgentEffort,
   effortCatalogFingerprint,
+  loadReadonlyDenyList,
+  readonlyDenyFingerprint,
+  mergeExcludeTools,
+  READONLY_DENY_MODULE,
   findCoreSharedFile,
   EFFORT_CATALOG_FILES,
   agentRuntimeContract,

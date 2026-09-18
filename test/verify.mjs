@@ -68,6 +68,13 @@ const realAgentsDirSnapshot = () => {
     .join('\n');
 };
 const realAgentsBefore = realAgentsDirSnapshot();
+// Snapshot the real user config file BEFORE any test runs. Section 11 asserts the
+// suite did not mutate the real install; a post-hoc comparison would be a
+// tautology, and asserting mere non-existence fails on a machine where the sync
+// has legitimately been run (that file pins the source and mode).
+const realConfigBefore = fs.existsSync(path.join(agentDir, _internals.CONFIG_FILE))
+  ? fs.readFileSync(path.join(agentDir, _internals.CONFIG_FILE), 'utf8')
+  : null;
 
 let passed = 0;
 const failures = [];
@@ -599,6 +606,47 @@ check(
   })(),
 );
 
+// ── read-only deny-list ────────────────────────────────────────────────────
+// `disallowedTools:` is install-time data too. GSD's table groups the checkers
+// (deny Write+Edit) apart from the verifier/auditors (deny Edit only, because
+// they still Write their report), and deliberately omits gsd-nyquist-auditor.
+const denyList = _internals.loadReadonlyDenyList(piCore, path.join(piCore, 'agents'));
+check(
+  'GSD read-only deny-list loads and maps MultiEdit away',
+  denyList.map['gsd-verifier']?.join(',') === 'edit' &&
+    denyList.map['gsd-plan-checker']?.join(',') === 'write,edit' &&
+    denyList.map['gsd-nyquist-auditor'] === undefined,
+  JSON.stringify(denyList.map),
+);
+check(
+  'a missing deny-list degrades to an empty map instead of throwing',
+  (() => {
+    const empty = _internals.loadReadonlyDenyList('/nonexistent-core', '/nonexistent-src');
+    return empty.map && Object.keys(empty.map).length === 0 && empty.path === null;
+  })(),
+);
+check(
+  'mergeExcludeTools unions declared and core deny entries without duplicates',
+  (() => {
+    const merged = _internals.mergeExcludeTools(['write'], ['edit', 'write']);
+    return merged.join(',') === 'write,edit';
+  })(),
+);
+check(
+  'the deny-list digest is stable and empty when the table is absent',
+  _internals.readonlyDenyFingerprint(piCore, path.join(piCore, 'agents')) ===
+    _internals.readonlyDenyFingerprint(undefined, path.join(piCore, 'agents')) &&
+    _internals.readonlyDenyFingerprint('/nonexistent-core', '/nonexistent-src') === '',
+);
+check(
+  'only the named read-only agents carry excludeTools',
+  (() => {
+    const withDeny = agentFiles.filter((f) => /^excludeTools: /m.test(fmOf(f))).map((f) => f.replace(/\.md$/, '')).sort();
+    return withDeny.join(',') === ['gsd-doc-verifier', 'gsd-eval-auditor', 'gsd-integration-checker', 'gsd-plan-checker', 'gsd-ui-auditor', 'gsd-ui-checker', 'gsd-verifier'].join(',');
+  })(),
+);
+
+
 
 
 // inline mode mirrors the command templates
@@ -732,7 +780,12 @@ if (fs.existsSync(jitiPath) && fs.existsSync(piSubagentsDir)) {
 // ── 11. hygiene: the suite must not mutate the real install ────────────────
 console.log('\n11) hygiene');
 const realConfig = path.join(agentDir, _internals.CONFIG_FILE);
-check('suite left the user config file untouched', !fs.existsSync(realConfig), `${realConfig} was created by the suite`);
+// Compare against the snapshot taken before the suite ran (see realConfigBefore).
+check(
+  'suite left the user config file untouched',
+  realConfigBefore === (fs.existsSync(realConfig) ? fs.readFileSync(realConfig, 'utf8') : null),
+  realConfigBefore === null ? `${realConfig} was created by the suite` : `${realConfig} was modified by the suite`
+);
 check(
   'real generated templates were not modified by the suite',
   realStateBefore === (fs.existsSync(realStateFile) ? fs.statSync(realStateFile).mtimeMs : null),
