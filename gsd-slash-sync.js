@@ -2497,8 +2497,8 @@ function sync(flags = {}) {
     if (flags.source !== undefined) patch.source = opts.source;
     if (flags.agents !== undefined) patch.syncAgents = opts.syncAgents;
     if (flags.noAgents !== undefined) patch.syncAgents = opts.syncAgents;
-  if (flags.globalContext !== undefined) patch.syncGlobalContext = opts.syncGlobalContext;
-  if (flags.noGlobalContext !== undefined) patch.syncGlobalContext = opts.syncGlobalContext;
+    if (flags.globalContext !== undefined) patch.syncGlobalContext = opts.syncGlobalContext;
+    if (flags.noGlobalContext !== undefined) patch.syncGlobalContext = opts.syncGlobalContext;
     const persisted = persistConfig(opts.agentDir, patch);
     if (persisted.length) report.notes.push(`persisted to ${CONFIG_FILE}: ${persisted.join(', ')}`);
   }
@@ -2848,7 +2848,7 @@ Options:
   --out <dir>                 command template directory (default <agentDir>/gsd-commands)
   --agents-out <dir>          pi-subagents agent directory (default <agentDir>/agents)
   --agents / --no-agents      convert GSD's subagents, or skip them (default: convert)
- --global-context / --no-global-context
+  --global-context / --no-global-context
                              write <agentDir>/AGENTS.md from the installed tools
   --source <dir>              explicit directory holding the canonical commands/gsd/*.md
   --max-inline-kb <n>         inline mode: fall back to reference above n KB per file (0 = no limit)
@@ -2857,11 +2857,12 @@ Options:
   --json                      machine-readable output
   --force, -f                 proceed even when the source looks broken
   --quiet, -q                 no output unless something changed or failed
-  --no-persist                do not write --mode/--naming/--source/--agents to the config file
+  --no-persist                do not write --mode/--naming/--source/--agents/--global-context
 
 Environment: GSD_SLASH_SYNC_MODE, GSD_SLASH_SYNC_NAMING, GSD_SLASH_SYNC_OUT,
              GSD_SLASH_SYNC_AGENTS_OUT, GSD_SLASH_SYNC_NO_AGENTS, GSD_SLASH_SYNC_SOURCE,
-             GSD_SLASH_SYNC_MAX_INLINE_KB, GSD_SLASH_SYNC_AUTO=off, GSD_SLASH_SYNC_NOTIFY=off
+             GSD_SLASH_SYNC_MAX_INLINE_KB, GSD_SLASH_SYNC_NO_GLOBAL_CONTEXT,
+             GSD_SLASH_SYNC_AUTO=off, GSD_SLASH_SYNC_NOTIFY=off
 
 Inside pi: /gsd-sync [same flags]  ·  commands appear as /gsd-<command>,
            agents as gsd-<role> for pi-subagents (subagent({ agent: "gsd-planner", task: "…" }))
