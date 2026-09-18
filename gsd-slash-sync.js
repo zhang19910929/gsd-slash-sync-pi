@@ -102,7 +102,7 @@ const GENERATOR = 'gsd-slash-sync';
 // Bump on ANY change to the conversion output (not just when the CLI surface
 // changes): the state file records this string and a mismatch forces a re-sync,
 // so an upgraded plugin never leaves stale templates behind.
-const GENERATOR_VERSION = '1.5.0';
+const GENERATOR_VERSION = '1.8.0';
 const STATE_FILE = '.gsd-slash-sync-state.json';
 // The agent set keeps its own state file: the two artifacts are written into
 // different directories and can be redirected independently, so each one carries
@@ -885,14 +885,19 @@ function mapAgentTools(data, lists, extensionTools, webToolsAvailable) {
       continue;
     }
     if (lower === 'agent' || lower === 'task') {
-      // Claude's nested-spawn tool → pi-subagents' `subagent`.
+      // Claude's nested-spawn tool. No tool name is emitted: the new package denies
+      // its own orchestration tools by default and nested spawning is switched off, so
+      // naming one here would only fire `tools-error:`. `caps.nested` still drives the
+      // contract text, which tells the child to report the spawn it wanted instead of
+      // attempting it.
       caps.nested = true;
-      push('subagent');
       continue;
     }
     if (lower === 'askuserquestion') {
       caps.asks = true;
-      push('contact_supervisor');
+      // `contact_supervisor` is pi-subagents' name for this channel and does not exist
+      // in @tintinweb/pi-subagents. The contract text covers what to do instead, so no
+      // tool name is emitted.
       continue;
     }
     if (lower === 'skill') {
@@ -911,16 +916,14 @@ function mapAgentTools(data, lists, extensionTools, webToolsAvailable) {
   }
   caps.dropped = [...new Set(caps.dropped)];
   caps.unknown = [...new Set(caps.unknown)];
-  // Extension tools the host actually provides. A declared allowlist is strict,
-  // so without this every extension tool stays invisible to the child even
-  // though the child loaded the extension (measured: 0 uses in 19 runs).
-  // Adding them can never empty the allowlist, so the failure mode the map
-  // guards against — a list that filters down to nothing — cannot happen.
-  for (const tool of Array.isArray(extensionTools) ? extensionTools : []) push(tool);
-  // Web tools go to every agent when the host provides them. The prompt is the
-  // selector — GSD's own text tells each child which lookups its job needs — so
-  // the allowlist only decides whether the tool exists, not when it is used.
-  if (webToolsAvailable) for (const tool of WEB_TOOL_NAMES) push(tool);
+  // Extension tools are deliberately NOT merged in. Under pi-subagents the allowlist
+  // was the only way to admit them (an unlisted extension tool was invisible even
+  // though the extension had loaded — 0 mentions across 19 runs). Under
+  // @tintinweb/pi-subagents the default is the opposite: every loaded extension's
+  // tools surface unless an `ext:` selector narrows them, and a plain name in
+  // `tools:` is checked against the built-in list, so naming an extension tool here
+  // fires `tools-error:` for that agent and adds nothing. The guidance is where it
+  // always was — in the prompt — and the tools exist either way.
   return { tools, caps };
 }
 
@@ -1180,12 +1183,15 @@ function resolveAgentEffort(name, data, catalog) {
  * @returns {string} YAML frontmatter block, including the trailing newline
  */
 // ── Global context file ──────────────────────────────────────────────────────
-// pi-subagents strips the global context file from children unless the agent
-// declares `inheritGlobalContext`, which buildAgentFrontmatter now always emits.
-// That makes `~/.pi/agent/AGENTS.md` the single channel that reaches BOTH the
-// top-level session and every spawned child — verified behaviourally: with the
-// flag on, a child reported the file's path and contents back, while the same
-// sentinel in APPEND_SYSTEM.md never reached a child at all.
+// This file serves the TOP-LEVEL session only.
+//
+// Under the old pi-subagents it also reached children, via an `inheritGlobalContext`
+// flag that suppressed the package's context stripping. Under
+// @tintinweb/pi-subagents that route is gone: child sessions are built with
+// `noContextFiles: true` hardcoded, so no context file is loaded into a child by any
+// setting. A child gets its guidance from its own prompt (the agent body) and from
+// the task text it is handed — which is why the sync also emits a task-text block
+// into the generated commands.
 //
 // The sync owns the file so the guidance is version-controlled here rather than
 // living only in the user's dotfiles, and so it can never name a tool the host
@@ -1193,68 +1199,111 @@ function resolveAgentEffort(name, data, catalog) {
 // detectHostExtensionTools found the package. One file, driven by the same
 // detection that builds the allowlists.
 
+/**
+ * job → the higher-tier tool → the shell habit it replaces.
+ *
+ * One declaration, three emit sites: the global context file (AGENTS.md), every
+ * generated agent's runtime contract, and the task text the orchestrator hands a
+ * child. Keeping it in one place is the only way the three cannot drift.
+ *
+ * `always: true` marks a pi builtin every session has; every other row is emitted
+ * only when the host really has the tool, because a strict allowlist that names an
+ * unresolvable tool fails the whole spawn instead of degrading.
+ */
+const TOOL_ROUTING = Object.freeze([
+  { tool: 'read', use: '`read`', job: 'read a file', instead: '`cat`, `head`, `tail`', always: true },
+  { tool: 'anchor_grep', use: '`anchor_grep`, then `read`', job: 'read a known line range', instead: '`sed -n`, `awk`, `grep -n`' },
+  { tool: 'ffgrep', use: '`ffgrep`', job: 'search file contents', instead: '`grep -r`, `rg`' },
+  { tool: 'fffind', use: '`fffind`', job: 'find files by path or name', instead: '`find`, `ls -R`' },
+  { tool: 'codegraph_explore', use: '`codegraph_explore`', job: 'code structure: who calls X, blast radius', instead: 'a chain of greps and reads' },
+  { tool: 'replace', use: '`replace`', job: 'edit a file', instead: '`sed -i`, heredocs' },
+  { tool: 'insert', use: '`insert`', job: 'insert lines into a file', instead: '`sed -i`, heredocs' },
+  { tool: 'undo_last_change', use: '`undo_last_change`', job: 'undo your own last edit', instead: 're-editing by hand' },
+  { tool: 'web_search', use: '`web_search`', job: 'search the web', instead: '`curl` at a search page' },
+  { tool: 'fetch_content', use: '`fetch_content`', job: 'read a URL, PDF or video', instead: '`curl`' },
+  { tool: 'get_search_content', use: '`get_search_content`', job: 're-read something already fetched', instead: 're-fetching the same URL' },
+  { tool: 'source_check', use: '`source_check`', job: 'verify a claim against sources', instead: 'asserting it from memory' },
+]);
+
+/** Every tool this host can actually put in a session, builtins included. */
+function availableTools(extensionTools, webToolsAvailable) {
+  return new Set([
+    ...(Array.isArray(extensionTools) ? extensionTools : []),
+    ...(webToolsAvailable ? WEB_TOOL_NAMES : []),
+    ...TOOL_ROUTING.filter((row) => row.always).map((row) => row.tool),
+  ]);
+}
+
+/** Markdown rows for the jobs this host has a higher-tier tool for. */
+function toolRoutingRows(present) {
+  const rows = TOOL_ROUTING.filter((row) => present.has(row.tool));
+  if (rows.length === 0) return [];
+  return [
+    '| job | use | not |',
+    '| --- | --- | --- |',
+    ...rows.map((row) => `| ${row.job} | ${row.use} | ${row.instead} |`),
+  ];
+}
+
+/**
+ * The build-output prohibition, with the indexed search tools named when the host
+ * has them. The 35 GB figure is a measured illustration, not a constant.
+ */
+function buildOutputRuleLines(searchTools) {
+  const named = searchTools.length
+    ? ` The indexed tools (${searchTools.map((t) => `\`${t}\``).join(', ')}) skip these directories by design.`
+    : '';
+  return [
+    'Never search, list, or read inside build and dependency directories — `target/`,',
+    '`node_modules/`, `dist/`, `.git/` are build output, not source, and nothing in them',
+    'answers your question.',
+    '',
+    'This is a failure mode, not a style preference. An unbounded `grep -rln <pattern>',
+    '<dir>/` there walks tens of gigabytes across hundreds of thousands of files, pins',
+    'one core for minutes, and returns nothing usable. Measured on a 35 GB Rust',
+    `\`target/\`: four minutes at 88% CPU before it had to be killed.${named}`,
+    '',
+    'If you genuinely need a recursive shell search, bound it. This is the minimum,',
+    'not a suggestion:',
+    '',
+    '```',
+    'grep -rn <pattern> <dir> \\',
+    '  --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.git \\',
+    "  --include='*.rs' --include='*.ts' --include='*.tsx'",
+    '```',
+    '',
+    '`--include=*` excludes nothing.',
+  ];
+}
+
 /** Tool package → the guidance paragraph it enables. Order is the emit order. */
 const GLOBAL_CONTEXT_SECTIONS = Object.freeze([
   {
-    // Cross-package on purpose: the table is only useful read as a whole, and a
-    // row is emitted only for a tool this host actually has. The any-of gate
-    // hands render() exactly the present subset, so the table can never name a
-    // tool that is not installed.
-    tools: ['ffgrep', 'fffind', 'codegraph_explore', 'anchor_grep'],
-    render: (tools) => {
-      const has = (name) => tools.includes(name);
-      const rows = [];
-      if (has('fffind')) rows.push(['find files by name or path', '`fffind`', '`find`, `ls -R`']);
-      if (has('ffgrep')) rows.push(['search file contents', '`ffgrep`', '`grep -r`, `rg`']);
-      if (has('anchor_grep')) {
-        rows.push(['read a line range of a file', '`anchor_grep`, then `read`', '`cat`, `sed -n`, `head`']);
-      }
-      if (has('codegraph_explore')) {
-        rows.push(['what calls X, what a change affects', '`codegraph_explore`', 'a chain of greps and reads']);
-      }
-      return [
-        '## Tool choice',
-        '',
-        'When a higher-tier tool exists for a job, use it instead of the shell',
-        'equivalent — same answer, a fraction of the cost:',
-        '',
-        '| job | use | not |',
-        '| --- | --- | --- |',
-        ...rows.map((row) => `| ${row[0]} | ${row[1]} | ${row[2]} |`),
-        '',
-        'A job with no row above has no higher-tier tool installed here; use the',
-        'shell for it, and bound the search.',
-        '',
-      ];
-    },
+    // Cross-package on purpose: the routing table is only useful read as a whole, and
+    // a row is emitted only for a tool this host actually has. The any-of gate hands
+    // render() exactly the present subset, so the table can never name a tool that
+    // is not installed. `present` adds the builtins (and web tools) for the rows
+    // that are not extension-provided.
+    tools: TOOL_ROUTING.filter((row) => !row.always).map((row) => row.tool),
+    render: (_available, present) => [
+      '## Tool choice',
+      '',
+      'When a higher-tier tool exists for a job, use it instead of the shell',
+      'equivalent — same answer, a fraction of the cost:',
+      '',
+      ...toolRoutingRows(present),
+      '',
+      'A job with no row above has no higher-tier tool installed here; use the',
+      'shell for it, and bound the search.',
+      '',
+    ],
   },
   {
     tools: ['ffgrep', 'fffind'],
-    render: (tools) => [
+    render: () => [
       '## Build output is not source',
       '',
-      'Never search, list, or read inside build and dependency directories:',
-      '`target/`, `node_modules/`, `dist/`, `.git/`, and anything `.gitignore`',
-      'already covers. They are not source, and nothing in them answers your',
-      'question.',
-      '',
-      'This is a failure mode, not a style preference. A bare `grep -rln <pattern>',
-      '<dir>/` in a Rust or Node project walks tens of gigabytes across hundreds of',
-      'thousands of files, pins one core for minutes, and returns nothing usable.',
-      'Measured on a 35 GB Rust `target/`: four minutes at 88% CPU before it had to',
-      `be killed. The indexed tools (${tools.map((t) => `\`${t}\``).join(', ')}) skip these`,
-      'directories by design, which is one more reason to reach for them first.',
-      '',
-      'If you genuinely need a recursive shell search, bound it. This is the',
-      'minimum, not a suggestion:',
-      '',
-      '```',
-      'grep -rn <pattern> <dir> \\',
-      '  --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.git \\',
-      "  --include='*.rs' --include='*.ts' --include='*.tsx'",
-      '```',
-      '',
-      '`--include=*` excludes nothing.',
+      ...buildOutputRuleLines(['ffgrep', 'fffind']),
       '',
     ],
   },
@@ -1304,23 +1353,24 @@ const GLOBAL_CONTEXT_SECTIONS = Object.freeze([
  * @returns {string}
  */
 function buildGlobalContext(extensionTools, webToolsAvailable) {
-  const present = new Set([
-    ...(Array.isArray(extensionTools) ? extensionTools : []),
-    ...(webToolsAvailable ? WEB_TOOL_NAMES : []),
-  ]);
+  // `present` drives the section gates (any-of) and carries every tool a session can
+  // actually have; `available` is the per-section subset render() used to receive.
+  const present = availableTools(extensionTools, webToolsAvailable);
   const sections = [];
   for (const section of GLOBAL_CONTEXT_SECTIONS) {
     const available = section.tools.filter((t) => present.has(t));
     if (!available.length) continue;
-    sections.push(...section.render(available));
+    sections.push(...section.render(available, present));
   }
   if (!sections.length) return '';
   return [
     '<!-- generated — do not edit; run /gsd-sync to regenerate -->',
     '# Global agent guidance',
     '',
-    'Applies to the top-level session and to every subagent that inherits global',
-    'context (`inheritGlobalContext: true`).',
+    'Applies to the top-level session. It does NOT reach subagents: the installed',
+    'pi-subagents builds child sessions with `noContextFiles: true`, so no context file is',
+    'loaded into a child by any route. A child gets its guidance from its own prompt (the',
+    'agent body) and from the task text it is handed.',
     '',
     ...sections,
     '## Scope',
@@ -1366,22 +1416,52 @@ function syncGlobalContext(opts, extensionTools, webToolsAvailable) {
 }
 
 
-function buildAgentFrontmatter({ name, description, tools, excludeTools, thinking, nested, inheritSkills }) {
+/**
+ * The frontmatter of one generated agent, for `@tintinweb/pi-subagents`.
+ *
+ * Only four things are emitted, and each one is deliberate:
+ *
+ *   name, description   the agent type and its label
+ *   tools               pi built-ins only
+ *   skills              inherit the operator's skill catalogue (GSD grants Skill)
+ *
+ * What is NOT here, and why:
+ *
+ *   extension tools     They arrive on their own. The new package leaves
+ *                       `allowedToolNames` unset and denies only the built-ins an
+ *                       agent did not ask for, so every loaded extension's tools
+ *                       surface unless an `ext:` selector narrows them — and a plain
+ *                       name in `tools:` is validated against the built-in list, so
+ *                       naming an extension tool there fires `tools-error:` and adds
+ *                       nothing. Verified on this host: a child reported `ffgrep`
+ *                       available while the old allowlist still named it.
+ *   thinking            Dropped on request. The routing-tier derivation that fed it is
+ *                       still computed for the fingerprint but no longer emitted.
+ *   excludeTools        Dropped on request. Read-only agents stay read-only through
+ *                       `tools:` alone: the package denies every built-in they did not
+ *                       ask for, and none of them asks for write or edit.
+ *   inheritGlobalContext / inheritProjectContext
+ *                       No equivalent exists. The package builds child sessions with
+ *                       `noContextFiles: true` hardcoded, so AGENTS.md cannot reach a
+ *                       child by any route; `inherit_context` is a different feature
+ *                       (it forks the parent conversation) and is not what GSD wants.
+ *   allowNestedSubagents
+ *                       Dropped on request: no nested spawning.
+ *
+ * `thinking` is NOT emitted, and that is the point rather than an omission. The package
+ * locks every field a frontmatter declares — "Agent tool parameters only fill fields the
+ * agent config leaves unspecified" — so pinning a level here would freeze it against the
+ * caller. Left out, the level is `undefined`, which the package documents as *inherit*
+ * (`agent-runner.ts`: "explicit option > agent config > undefined (inherit)"), so a
+ * child follows the session's current level and the caller can still override it per
+ * call. GSD's per-role routing tier is read for the fingerprint but is deliberately not
+ * turned into a locked level.
+ */
+function buildAgentFrontmatter({ name, description, tools, inheritSkills }) {
   const lines = ['---', `name: ${yamlQuote(name)}`, `description: ${yamlQuote(description)}`];
   // An empty `tools:` would mean "no tools at all", not "default tools".
   if (tools.length) lines.push(`tools: ${tools.join(', ')}`);
-  if (excludeTools.length) lines.push(`excludeTools: ${excludeTools.join(', ')}`);
-  // pi-subagents strips the global context file from children by default. GSD's
-  // host-tool guidance lives there (one file, inherited by both the top-level
-  // session and every child) rather than duplicated into 35 agent bodies, so the
-  // flag has to be on for that single source to reach a child at all.
-  lines.push('inheritGlobalContext: true');
-  if (thinking) lines.push(`thinking: ${thinking}`);
-  if (nested) lines.push('allowNestedSubagents: true');
-  if (inheritSkills) lines.push('inheritSkills: true');
-  // Custom agents drop repository instructions by default; GSD's agents are repo
-  // workers that assume they see the project's conventions.
-  lines.push('inheritProjectContext: true');
+  if (inheritSkills) lines.push('skills: true');
   lines.push('---');
   return lines.join('\n') + '\n';
 }
@@ -1575,47 +1655,57 @@ function inlineContext(text, { baseDir, ctx, seen, depth = 0, acc }) {
  *
  * @returns {string[]} lines to append after the runtime contract
  */
-function subagentDispatchBlock(agents) {
+function subagentDispatchBlock(agents, ctx) {
   const core = [];
   core.push(`<gsd_subagent_dispatch agents="${agents.names.length}" dir="${agents.dir}">`);
   core.push(
-    'GSD\u2019s agent definitions are installed as pi-subagents agents, so GSD\u2019s spawn steps must be translated:',
+    'GSD\u2019s agent definitions are installed as @tintinweb/pi-subagents agents, so GSD\u2019s spawn steps must be translated:',
   );
   core.push(
     '  \u2022 `Agent(subagent_type="gsd-planner", model="\u2026", prompt="\u2026")` \u2192 ' +
-      '`subagent({ agent: "gsd-planner", task: "\u2026" })`',
+      '`Agent({ subagent_type: "gsd-planner", prompt: "\u2026", description: "\u2026" })` \u2014 `description` is required by the schema and shows in the agent list.',
   );
-  core.push('  \u2022 `run_in_background: false` \u2192 `async: false` (block and wait for the result); `true` or absent \u2192 leave `async` off (background is the default).');
+  core.push(
+    '  \u2022 `run_in_background: false` \u2192 `run_in_background: false` (block and wait); `true` or absent \u2192 leave it off (background is the default).',
+  );
   core.push(
     '  \u2022 `model="{PLANNER_MODEL}"` and friends are unresolved placeholders here \u2014 omit `model` so the agent\u2019s ' +
-      'own default applies, or pass an exact `provider/id` copied from `subagent({action:"models"})`.',
+      'own default applies, or pass an exact `provider/id`.',
   );
-  core.push('  \u2022 `subagent_type="general-purpose"` \u2192 `agent: "delegate"`.');
+  core.push('  \u2022 `subagent_type="general-purpose"` \u2192 `subagent_type: "general-purpose"` (the package\u2019s own default agent).');
   core.push(
-    '  \u2022 `TaskOutput` and any "wait for the subagent" step \u2192 `subagent({action:"status", id})` ' +
+    '  \u2022 `TaskOutput` and any "wait for the subagent" step \u2192 `get_subagent_result({ agent_id })` ' +
       '(an agent id is not a task id, which is why GSD warns about this); a background child also wakes you when it finishes.',
   );
   core.push(
-    '  \u2022 Several spawns in one step \u2192 one `subagent({ workflowScript })` call with ' +
-      '`const [a, b] = await runs.all([{ key, agent, task }, \u2026])` and an explicit `return`.',
+    '  \u2022 Several spawns in one step \u2192 one `SubagentWorkflow` call, or repeat `Agent` and collect with `get_subagent_result`.',
   );
   core.push(
     '  \u2022 Ignore what `gsd_run query resolve-dispatch-type` answers on pi: it maps every role to ' +
       '`coder`/`explore`/`plan`, which do not exist in pi. Dispatch the `gsd-*` role name itself.',
   );
   core.push(
-    '  \u2022 Spawn agents that need web or MCP lookups as background children: a foreground child ' +
-      '(`async: false`) does not load the installed pi extension packages. Use `async: false` only where GSD ' +
-      'explicitly requires a blocking spawn (its debug session manager).',
-  );
-  core.push(`  \u2022 Installed roles: ${agents.names.map((n) => `\`${n}\``).join(', ')}.`);
-  core.push(
-    '  \u2022 Confirm a role with `subagent({action:"list", capabilities:true})`, and give a spawned agent the same ' +
+    '  \u2022 Installed roles can be confirmed from the `Agent` tool\u2019s own type list. Give a spawned agent the same ' +
       'task text GSD\u2019s `prompt` would have used.',
   );
   core.push(
     '  \u2022 If a spawn genuinely cannot run, do that step yourself in this session \u2014 never skip it.',
   );
+  // The one channel that demonstrably changes a child's tool choice. Measured on this
+  // project's phase-5 runs: the identical routing table in four agents' own system
+  // prompts produced zero indexed-tool calls in 153; a task that named the tools
+  // produced calls on the first try. A child follows its task text, not its prompt.
+  const present = availableTools(ctx && ctx.extensionTools, ctx && ctx.webToolsAvailable);
+  const rows = toolRoutingRows(present);
+  if (rows.length > 1) {
+    core.push('  \u2022 Tool choice is decided by the TASK TEXT, not by the child\u2019s own prompt: put the block below at the end of every task you hand a child. A child given only its prompt reaches for `bash`/`grep` no matter what that prompt says.',);
+    const searchTools = ['ffgrep', 'fffind'].filter((tool) => present.has(tool));
+    core.push('    <task_tool_routing>');
+    core.push('    Tool routing — use these, not their shell equivalents:');
+    for (const row of rows) core.push(`    ${row}`);
+    core.push(`    ${buildOutputRuleLines(searchTools).join(' ')}`);
+    core.push('    </task_tool_routing>');
+  }
   core.push('</gsd_subagent_dispatch>');
   return core;
 }
@@ -1702,7 +1792,7 @@ function runtimeContract({ name, description, argumentHint, data, ctx, mode, ref
   lines.push('</runtime_contract>');
   if (agents.enabled && agents.names.length) {
     lines.push('');
-    lines.push(...subagentDispatchBlock(agents));
+    lines.push(...subagentDispatchBlock(agents, ctx));
   }
   lines.push('');
   lines.push(`<user_arguments>$ARGUMENTS</user_arguments>`);
@@ -1846,42 +1936,12 @@ function agentRuntimeContract({ name, ctx, mode, refs }) {
   } else if (mode === 'inline' && refs.length > 0) {
     item('The files this agent references are inlined below — treat them as part of your instructions.');
   }
-  // Tool routing, stated in the agent's own prompt rather than only in the
-  // inherited global context. Measured on this project's phase-5 runs: with the
-  // same names in the allowlist and the same paragraph in AGENTS.md, four review
-  // agents made 153 tool calls and used an indexed tool zero times — they ran
-  // `grep`/`rg` inside `bash` instead. A task prompt that named the tools produced
-  // calls immediately. This block puts that wording where the agent's body is.
-  // Rows appear only for tools the host actually has, so it can never name one
-  // that cannot resolve.
-  const routingTools = Array.isArray(ctx.extensionTools) ? ctx.extensionTools : [];
-  const hasTool = (tool) => routingTools.includes(tool);
-  const routingRows = [];
-  if (hasTool('ffgrep')) {
-    routingRows.push('   | search file contents | `ffgrep` | `grep -r`, `rg` |');
-  }
-  if (hasTool('fffind')) {
-    routingRows.push('   | find files by name or path | `fffind` | `find`, `ls -R` |');
-  }
-  if (hasTool('codegraph_explore')) {
-    routingRows.push('   | what calls X, what a change affects | `codegraph_explore` | a chain of greps |');
-  }
-  if (hasTool('anchor_grep')) {
-    routingRows.push('   | read a line range | `anchor_grep`, then `read` | `cat`, `sed -n`, `head` |');
-  }
-  if (routingRows.length > 0) {
-    item('Tool routing — use the higher-tier tool, do not fall back to its shell equivalent:');
-    lines.push('   | job | use | not |');
-    lines.push('   | --- | --- | --- |');
-    lines.push(...routingRows);
-  }
-  item(
-    'Never search, list, or read inside build and dependency directories — `target/`, ' +
-      '`node_modules/`, `dist/`, `.git/` are build output, not source, and nothing in them answers ' +
-      'your question. An unbounded `grep -rln <pattern> <dir>/` there walks tens of gigabytes, ' +
-      'pins a core for minutes, and returns nothing usable. If you must run a recursive shell ' +
-      'search, pass `--exclude-dir` and `--include`.',
-  );
+  // No tool-routing block here on purpose. It was tried and removed: the same table in
+  // four agents' own system prompts produced zero indexed-tool calls in 153 (0/38 on a
+  // second run), while it costs tokens on every turn of every child, because a system
+  // prompt is re-sent on each one. Tool choice is carried by prose only — AGENTS.md and
+  // the turn message — see the `syncGlobalContext` option and the before_agent_start
+  // handler below.
   item(
     'Slash commands in pi use the hyphen form: `/gsd-<name>`. Wherever GSD text says `/gsd:<name>`, use `/gsd-<name>`.',
   );
@@ -1903,10 +1963,10 @@ function agentRuntimeContract({ name, ctx, mode, refs }) {
   }
   if (caps.asks) {
     item(
-      '`AskUserQuestion` does not exist in pi. When you would ask the user, call `contact_supervisor` with ' +
-        '`reason: "need_decision"` — the orchestrator relays it and replies with the answer. If that tool is not ' +
-        'available in this session, put the question in your final report and continue with the safest ' +
-        'assumption rather than waiting.',
+      '`AskUserQuestion` does not exist in pi, and the child-to-parent channel pi-subagents',
+        ' used for it (`contact_supervisor`) is not registered by @tintinweb/pi-subagents.',
+        ' Put the question in your final report — the orchestrator relays it — and continue with',
+        ' the safest assumption rather than waiting.',
     );
   }
   if (caps.web || caps.mcp.length > 0) {
@@ -1926,8 +1986,10 @@ function agentRuntimeContract({ name, ctx, mode, refs }) {
   }
   if (caps.nested) {
     item(
-      'You may spawn further subagents with `subagent({ agent, task })` using the GSD roles you need ' +
-        '(for example `gsd-debugger`), and collect their results before you finish.',
+      'GSD has you spawn further agents (for example `gsd-debugger`). Nested spawning is',
+        ' switched off for this install, so do not attempt it: do the step yourself in this',
+        ' session, or put the spawn you wanted in your final report so the orchestrator can',
+        ' dispatch it.',
     );
   }
   if (caps.unknown.length) {
@@ -2028,10 +2090,10 @@ function convertAgent(raw, name, ctx) {
 
   if (caps.dropped.length) notes.push(`dropped tool(s) with no pi equivalent: ${caps.dropped.join(', ')}`);
   if (caps.unknown.length) notes.push(`unknown tool(s) kept out of the allowlist: ${caps.unknown.join(', ')}`);
-  if (data.effort && !thinking) notes.push(`effort "${data.effort}" is not a pi thinking level — dropped`);
-  if (!thinking && effortCatalog.files.length === 0) {
-    notes.push('no GSD routing-tier catalog found — agent falls back to the model default thinking level');
-  }
+  // No note about `effort:`/thinking: the level is intentionally not emitted, so a
+  // per-agent line about dropping it would describe a mechanism that no longer runs.
+  // The routing-tier catalog is still digested into the fingerprint above.
+  void effortCatalog;
 
   const mustRead =
     mode === 'reference' && refs.length
@@ -2046,9 +2108,6 @@ function convertAgent(raw, name, ctx) {
       name,
       description,
       tools,
-      excludeTools,
-      thinking,
-      nested: caps.nested,
       inheritSkills: caps.skill,
     }) +
     // Deliberately timestamp-free: the generated bytes must be a pure function of
@@ -2368,6 +2427,10 @@ function sync(flags = {}) {
     naming: opts.naming,
     maxInlineKb: opts.maxInlineKb,
     roster: source.valid.map((f) => f.replace(/\.md$/, '')),
+    // Same detection the agent side uses, so the generated dispatch block can name the
+    // tools a child will really have in the task text it tells the orchestrator to send.
+    extensionTools: detectHostExtensionTools(opts.agentDir),
+    webToolsAvailable: hostProvidesWebTools(opts.agentDir),
     rosterPattern: null,
   };
   ctx.rosterPattern = buildColonPattern(ctx.roster);
@@ -2951,7 +3014,8 @@ Environment: GSD_SLASH_SYNC_MODE, GSD_SLASH_SYNC_NAMING, GSD_SLASH_SYNC_OUT,
              GSD_SLASH_SYNC_AUTO=off, GSD_SLASH_SYNC_NOTIFY=off
 
 Inside pi: /gsd-sync [same flags]  ·  commands appear as /gsd-<command>,
-           agents as gsd-<role> for pi-subagents (subagent({ agent: "gsd-planner", task: "…" }))
+           agents as gsd-<role> for @tintinweb/pi-subagents
+           (Agent({ subagent_type: "gsd-planner", prompt: "…", description: "…" }))
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3012,6 +3076,62 @@ module.exports = function gsdSlashSyncExtension(pi) {
   // templates without touching the user's own ~/.pi/agent/prompts directory.
   // Fires after session_start on every startup and reload.
   pi.on('resources_discover', async () => ({ promptPaths: [outDir] }));
+
+  // ── tool routing, delivered through the one channel that measurably works.
+  //
+  // On this project's phase-5 runs the same table sat in four review agents' own
+  // system prompts and produced zero indexed-tool calls in 153 (62 recursive
+  // `grep`/`rg` inside `bash`); the same table in AGENTS.md did no better. A task
+  // that named the tools called them on the first try. The variable is placement:
+  // the instruction has to arrive with the turn, not sit in a prompt.
+  //
+  // `before_agent_start` is the hook that can do that. pi appends the returned
+  // message AFTER the user prompt in that turn's messages, which is exactly the
+  // position that worked; and pi-subagents' own child-side watchdog listens to the
+  // same event, so every child session gets it too — no orchestrator has to
+  // remember the block, which is what every prompt-only attempt depended on.
+  //
+  // Once per session on purpose: re-injecting every turn would churn the prompt
+  // cache and repeat what the model already has in front of it.
+  let toolRoutingInjected = false;
+  pi.on('session_start', () => {
+    toolRoutingInjected = false;
+  });
+  pi.on('before_agent_start', () => {
+    if (toolRoutingInjected) return undefined;
+    let present;
+    try {
+      const dir = resolveAgentDir();
+      present = availableTools(detectHostExtensionTools(dir), hostProvidesWebTools(dir));
+    } catch {
+      return undefined;
+    }
+    const rows = toolRoutingRows(present);
+    if (rows.length < 2) return undefined;
+    toolRoutingInjected = true;
+    const searchTools = ['ffgrep', 'fffind'].filter((tool) => present.has(tool));
+    return {
+      message: {
+        customType: 'gsd-tool-routing',
+        content: [
+          'Tool routing — use these, not their shell equivalents:',
+          '',
+          ...rows,
+          '',
+          ...buildOutputRuleLines(searchTools),
+        ].join('\n'),
+        display: false,
+      },
+    };
+  });
+
+  // ── the guard: refuse the two bash kinds that have a better tool.
+  //
+  // Every prompt-only attempt failed while `bash` was available — the same routing
+  // table in the system prompt (0/38), in AGENTS.md (0/153) and as a turn message
+  // (0/34) all produced zero indexed-tool calls, and agents used the tools the
+  // moment they had no shell to reach for. What is left is mechanical.
+  //
 
   // ── automatic sync when GSD Core moved ahead of the generated set.
   pi.on('session_start', async (event, ctx) => {
@@ -3247,6 +3367,10 @@ module.exports._internals = {
   syncGlobalContext,
   GLOBAL_CONTEXT_SECTIONS,
   GLOBAL_CONTEXT_FILE,
+  TOOL_ROUTING,
+  availableTools,
+  toolRoutingRows,
+  buildOutputRuleLines,
   loadEffortCatalog,
   resolveAgentEffort,
   effortCatalogFingerprint,
