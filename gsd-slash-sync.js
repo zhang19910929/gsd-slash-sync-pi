@@ -921,6 +921,128 @@ function mapAgentEffort(rawEffort) {
   return THINKING_LEVELS.includes(level) ? level : null;
 }
 
+// ── Install-time effort resolution ───────────────────────────────────────────
+// GSD Core does NOT put `effort:` in the pristine `gsd-core/agents/` bundle. Its
+// installer injects the key at install time (bin/lib/install-effort-resolver.cjs)
+// by looking each agent's routing tier up in two shipped tables:
+//
+//   bin/shared/model-catalog.json          gsd-planner → routingTier: "heavy"
+//   bin/shared/config-defaults.manifest.json
+//                                          heavy → effort "xhigh"
+//
+// The already-converted Claude tree at ~/.claude/agents happens to carry the
+// resulting `effort:` lines, so a sync run that reads only gsd-core/agents/ sees
+// no effort at all and silently emits agents with no `thinking:` level. That is
+// exactly what happened here: a re-sync wiped the level from all 35 agents, and
+// the previous install-time restore was a post-hoc patch the next sync erased.
+//
+// Reading GSD's own tables instead keeps the sync self-sufficient AND drift-free:
+// if upstream re-tiers an agent, the next sync follows it automatically. This
+// mirrors what `mapAgentTools` already does for the tool allowlist — derive from
+// the shipped catalog rather than hardcode a second copy here.
+const EFFORT_CATALOG_FILES = ['model-catalog.json', 'config-defaults.manifest.json'];
+const _effortCatalogCache = new Map();
+
+/**
+ * Locate a GSD Core shipped table, trying the resolved core root and then the
+ * source tree's parent (the two layouts seen in practice).
+ * @param {string|undefined} coreRoot
+ * @param {string|undefined} srcDir
+ * @param {string} file
+ * @returns {string|null}
+ */
+function findCoreSharedFile(coreRoot, srcDir, file) {
+  const bases = [coreRoot, srcDir ? path.resolve(srcDir, '..') : null, srcDir];
+  for (const base of bases) {
+    if (!base) continue;
+    const p = path.join(base, 'bin', 'shared', file);
+    if (isFile(p)) return p;
+  }
+  return null;
+}
+
+/**
+ * Build `agent name → pi thinking level` from GSD's own routing-tier tables.
+ * @param {string|undefined} coreRoot
+ * @param {string|undefined} srcDir
+ * @returns {{ map: Record<string,string>, files: string[] }}
+ */
+function loadEffortCatalog(coreRoot, srcDir) {
+  const found = EFFORT_CATALOG_FILES.map((f) => findCoreSharedFile(coreRoot, srcDir, f));
+  if (found.some((p) => !p)) return { map: {}, files: [] };
+  const key = found.join('\u0000');
+  const hit = _effortCatalogCache.get(key);
+  if (hit) return hit;
+
+  const result = { map: {}, files: found };
+  try {
+    const catalog = JSON.parse(readIfExists(found[0]) || '{}');
+    const defaults = JSON.parse(readIfExists(found[1]) || '{}');
+    const tierEffort = (defaults.effort && defaults.effort.routing_tier_defaults) || {};
+    // The agent table is nested somewhere under the catalog root; find the first
+    // object whose values carry a routingTier.
+    const stack = [catalog];
+    let table = null;
+    while (stack.length && !table) {
+      const node = stack.pop();
+      if (!node || typeof node !== 'object') continue;
+      const values = Object.values(node);
+      if (values.some((v) => v && typeof v === 'object' && v.routingTier)) {
+        table = node;
+        break;
+      }
+      for (const v of values) if (v && typeof v === 'object') stack.push(v);
+    }
+    for (const [agent, entry] of Object.entries(table || {})) {
+      const tier = entry && entry.routingTier;
+      const level = tier && tierEffort[tier];
+      if (level && THINKING_LEVELS.includes(String(level).toLowerCase())) {
+        result.map[agent] = String(level).toLowerCase();
+      }
+    }
+  } catch {
+    // A malformed table must not break the sync; the source `effort:` key and the
+    // agent default still apply. Callers report the miss through convertAgent.
+    return { map: {}, files: [] };
+  }
+  _effortCatalogCache.set(key, result);
+  return result;
+}
+
+/**
+ * Fingerprint-able digest of the resolved effort tables.
+ *
+ * Deliberately hashes the file *contents* rather than the parsed map: `status`
+ * and `syncAgents` each derive their core root with their own expression, and a
+ * content digest stays identical whenever the two resolve to the same tables.
+ * A parsed-map comparison would report STALE forever on the smallest path skew,
+ * which is the exact failure the neighbouring fingerprint comment warns about.
+ * @param {string|undefined} coreRoot
+ * @param {string|undefined} srcDir
+ * @returns {string} hex digest, or '' when no table is present
+ */
+function effortCatalogFingerprint(coreRoot, srcDir) {
+  const found = EFFORT_CATALOG_FILES.map((f) => findCoreSharedFile(coreRoot, srcDir, f));
+  if (found.some((p) => !p)) return '';
+  return sha256(found.map((p) => readIfExists(p) || '').join('\u0000'));
+}
+
+/**
+ * Resolve an agent's pi thinking level: an explicit source `effort:` wins, then
+ * GSD's routing-tier catalog.
+ * @param {string} name
+ * @param {object} data parsed source frontmatter
+ * @param {{ map: Record<string,string> }} catalog
+ * @returns {string|null}
+ */
+function resolveAgentEffort(name, data, catalog) {
+  const declared = mapAgentEffort(data && data.effort);
+  if (declared) return declared;
+  const fromCatalog = catalog && catalog.map ? catalog.map[name] : null;
+  return fromCatalog || null;
+}
+
+
 // ── Indexed-search guidance ──────────────────────────────────────────────────
 // mapAgentTools already grants every GSD agent the host's indexed search tools,
 // but the upstream GSD bodies still tell the reader to use plain `grep`/`find`.
@@ -1544,7 +1666,10 @@ function convertAgent(raw, name, ctx) {
   // skills catalogue to work the same way.
   if (!caps.skill && /(\/skill:|\bskill\(|skills?\/|SKILL\.md|skill to invoke)/i.test(body)) caps.skill = true;
   const excludeTools = mapAgentDisallowed(data, lists);
-  const thinking = mapAgentEffort(data.effort);
+  // `effort:` is absent from the pristine gsd-core bundle — GSD injects it at
+  // install time from its routing-tier tables, so resolve through those too.
+  const effortCatalog = loadEffortCatalog(ctx.coreRoot, ctx.srcDir);
+  const thinking = resolveAgentEffort(name, data, effortCatalog);
   const rosterPattern = ctx.rosterPattern;
   const notes = [];
 
@@ -1606,6 +1731,9 @@ function convertAgent(raw, name, ctx) {
   if (caps.dropped.length) notes.push(`dropped tool(s) with no pi equivalent: ${caps.dropped.join(', ')}`);
   if (caps.unknown.length) notes.push(`unknown tool(s) kept out of the allowlist: ${caps.unknown.join(', ')}`);
   if (data.effort && !thinking) notes.push(`effort "${data.effort}" is not a pi thinking level — dropped`);
+  if (!thinking && effortCatalog.files.length === 0) {
+    notes.push('no GSD routing-tier catalog found — agent falls back to the model default thinking level');
+  }
 
   const mustRead =
     mode === 'reference' && refs.length
@@ -1723,6 +1851,11 @@ function syncAgents(opts, ctx, source, agentSource, report) {
     extensionTools,
     webToolsAvailable,
     coreRoot: ctx.coreRoot,
+    // The thinking level is derived from GSD's shipped routing-tier tables, so a
+    // re-tier upstream must force a re-sync even when no agent source changed.
+    // Key order is load-bearing: this object is hashed with JSON.stringify and
+    // status() rebuilds it, so both sides must insert the key in the same slot.
+    effortCatalog: effortCatalogFingerprint(ctx.coreRoot, agentSource.dir),
     version: ctx.version,
     agents: [],
   };
@@ -2244,6 +2377,9 @@ function status(flags = {}) {
         extensionTools: detectHostExtensionTools(opts.agentDir),
         webToolsAvailable: hostProvidesWebTools(opts.agentDir),
         coreRoot: source.coreRoot || path.resolve(source.dir, '..', '..'),
+        // Same digest syncAgents uses — the thinking level comes from these
+        // tables, so a re-tier upstream must flip status to STALE.
+        effortCatalog: effortCatalogFingerprint(source.coreRoot || path.resolve(source.dir, '..', '..'), agentSource.dir),
         version: source.version,
         agents: agentParts,
       });
@@ -2751,6 +2887,11 @@ module.exports._internals = {
   SEARCH_GUIDANCE_TAG,
   SEARCH_GUIDANCE_ANCHOR,
   SEARCH_GUIDANCE_TOOLS,
+  loadEffortCatalog,
+  resolveAgentEffort,
+  effortCatalogFingerprint,
+  findCoreSharedFile,
+  EFFORT_CATALOG_FILES,
   agentRuntimeContract,
   subagentDispatchBlock,
   discoverSource,

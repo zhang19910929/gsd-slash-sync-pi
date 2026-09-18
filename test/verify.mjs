@@ -555,6 +555,51 @@ check(
   _internals.searchGuidanceBlock(['read', 'bash']) === '' && _internals.searchGuidanceBlock(['ffgrep']).includes('ffgrep'),
 );
 
+// ── install-time effort resolution ─────────────────────────────────────────
+// `effort:` is not in the pristine gsd-core/agents bundle — GSD injects it at
+// install time from its routing-tier tables. Reading only the agent sources
+// silently produced agents with no `thinking:` at all (measured: a re-sync
+// wiped the level from all 35), so the sync now derives it from the same tables
+// the installer uses.
+const effortCatalog = _internals.loadEffortCatalog(piCore, path.join(piCore, 'agents'));
+check(
+  'the GSD routing-tier catalog resolves a thinking level per agent',
+  Object.keys(effortCatalog.map).length >= 30 &&
+    effortCatalog.map['gsd-planner'] === 'xhigh' &&
+    effortCatalog.map['gsd-codebase-mapper'] === 'low',
+  `entries=${Object.keys(effortCatalog.map).length} planner=${effortCatalog.map['gsd-planner']} mapper=${effortCatalog.map['gsd-codebase-mapper']}`,
+);
+check(
+  'an explicit source effort key still wins over the catalog',
+  (() => {
+    const cat = { map: { 'gsd-probe': 'low' } };
+    return _internals.resolveAgentEffort('gsd-probe', { effort: 'xhigh' }, cat) === 'xhigh' &&
+      _internals.resolveAgentEffort('gsd-probe', {}, cat) === 'low' &&
+      _internals.resolveAgentEffort('gsd-unknown', {}, cat) === null;
+  })(),
+);
+check(
+  'a missing catalog degrades to no thinking level instead of throwing',
+  (() => {
+    const empty = _internals.loadEffortCatalog('/nonexistent-core', '/nonexistent-src');
+    return empty.map && Object.keys(empty.map).length === 0 && empty.files.length === 0;
+  })(),
+);
+check(
+  'every generated agent carries a thinking level',
+  [...agentSources.keys()].every((n) => /^thinking: /m.test(fmOf(n))),
+  [...agentSources.keys()].filter((n) => !/^thinking: /m.test(fmOf(n))).join(', '),
+);
+check(
+  'the effort catalog is memoised per resolved table pair',
+  (() => {
+    const a = _internals.loadEffortCatalog(piCore, path.join(piCore, 'agents'));
+    const b = _internals.loadEffortCatalog(piCore, path.join(piCore, 'agents'));
+    return a === b && Object.keys(a.map).length > 0;
+  })(),
+);
+
+
 
 // inline mode mirrors the command templates
 const agentsInlineDir = path.join(tmpRoot, 'agents-inline');
