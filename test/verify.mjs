@@ -491,6 +491,71 @@ check(
     /pi web tools/.test(agentSources.get('gsd-planner.md')),
 );
 
+// ── indexed-search guidance ────────────────────────────────────────────────
+// Every GSD body still says plain `grep`/`find`; an unbounded recursive grep
+// from one of them walked this project's 35 GB target/ tree and had to be
+// killed. The block is content-driven (needs the tool in the allowlist) and
+// self-retiring (skipped once upstream names the indexed tools).
+const probeAgent = (tools, body) =>
+  _internals.convertAgent(
+    `---\nname: gsd-search-probe\ndescription: probe\ntools: ${tools}\n---\n${body}\n`,
+    'gsd-search-probe',
+    { ..._internals.resolveOptions({}, {}), srcDir: here, coreRoot: path.join(agentDir, 'gsd-core'), version: 'test', roster: [], rosterPattern: null, extensionTools: _internals.SEARCH_GUIDANCE_TOOLS, webToolsAvailable: false },
+  );
+
+check(
+  'indexed-search guidance is injected into every generated agent',
+  [...agentSources.keys()].every((n) => {
+    const text = fs.readFileSync(path.join(agentsTmp, n), 'utf8');
+    return text.includes(`<${_internals.SEARCH_GUIDANCE_TAG}>`);
+  }),
+);
+check(
+  'the injected block names the indexed tools the allowlist actually grants',
+  (() => {
+    const c = probeAgent('Read, Grep', 'plain body');
+    return _internals.SEARCH_GUIDANCE_TOOLS.every((t) => c.content.includes(t));
+  })(),
+);
+check(
+  'the injected block bounds recursive shell searches',
+  (() => {
+    const c = probeAgent('Read, Grep', 'plain body');
+    return c.content.includes('--exclude-dir=target') && c.content.includes('--exclude-dir=node_modules');
+  })(),
+);
+check(
+  'no block is injected when the allowlist has no indexed search tool',
+  (() => {
+    const c = _internals.convertAgent(
+      '---\nname: gsd-nosearch\ndescription: probe\ntools: Read\n---\nbody\n',
+      'gsd-nosearch',
+      { ..._internals.resolveOptions({}, {}), srcDir: here, coreRoot: path.join(agentDir, 'gsd-core'), version: 'test', roster: [], rosterPattern: null, extensionTools: [], webToolsAvailable: false },
+    );
+    return !c.content.includes(_internals.SEARCH_GUIDANCE_TAG);
+  })(),
+);
+check(
+  'injection is idempotent and self-retiring',
+  (() => {
+    const once = _internals.injectSearchGuidance('body', ['ffgrep']);
+    const twice = _internals.injectSearchGuidance(once.text, ['ffgrep']);
+    const already = _internals.injectSearchGuidance('body — use ffgrep instead of grep', ['ffgrep']);
+    return (
+      once.injected === true &&
+      twice.injected === false &&
+      twice.text === once.text &&
+      already.injected === false &&
+      already.text === 'body — use ffgrep instead of grep'
+    );
+  })(),
+);
+check(
+  'searchGuidanceBlock returns an empty string with no indexed tool available',
+  _internals.searchGuidanceBlock(['read', 'bash']) === '' && _internals.searchGuidanceBlock(['ffgrep']).includes('ffgrep'),
+);
+
+
 // inline mode mirrors the command templates
 const agentsInlineDir = path.join(tmpRoot, 'agents-inline');
 const inlineAgents = plugin.sync({ agentDir, outDir: path.join(tmpRoot, 'agents-inline-cmds'), agentsOut: agentsInlineDir, mode: 'inline', persist: false, cwd: here });

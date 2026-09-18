@@ -101,7 +101,7 @@ const GENERATOR = 'gsd-slash-sync';
 // Bump on ANY change to the conversion output (not just when the CLI surface
 // changes): the state file records this string and a mismatch forces a re-sync,
 // so an upgraded plugin never leaves stale templates behind.
-const GENERATOR_VERSION = '1.2.0';
+const GENERATOR_VERSION = '1.3.0';
 const STATE_FILE = '.gsd-slash-sync-state.json';
 // The agent set keeps its own state file: the two artifacts are written into
 // different directories and can be redirected independently, so each one carries
@@ -921,6 +921,70 @@ function mapAgentEffort(rawEffort) {
   return THINKING_LEVELS.includes(level) ? level : null;
 }
 
+// ── Indexed-search guidance ──────────────────────────────────────────────────
+// mapAgentTools already grants every GSD agent the host's indexed search tools,
+// but the upstream GSD bodies still tell the reader to use plain `grep`/`find`.
+// That combination has a measured failure mode here: an executor ran
+// `grep -rn "已激活" src src-tauri --include=*`, which walked this project's
+// 35 GB `src-tauri/target` tree, sat at ~54% CPU for over four minutes, and had
+// to be killed by hand. The same body also cost the agent its turn budget.
+//
+// The block below is therefore content-driven, not role-driven: it is injected
+// only when the *generated* allowlist actually contains the indexed tool, so we
+// never tell an agent to call something it cannot call. Uniformity across the
+// roster falls out of mapAgentTools granting them to everyone — it is not a
+// hardcoded per-agent policy.
+//
+// It is also self-retiring. If a future GSD release adopts the indexed tools
+// upstream, the anchor check below leaves the body untouched instead of adding
+// a second, possibly contradictory, section.
+const SEARCH_GUIDANCE_TAG = 'gsd_pi_search';
+const SEARCH_GUIDANCE_ANCHOR = 'ffgrep';
+const SEARCH_GUIDANCE_TOOLS = ['ffgrep', 'fffind', 'codegraph_explore', 'fff-multi-grep'];
+
+/**
+ * Build the indexed-search guidance block.
+ * @param {string[]} toolNames the generated allowlist for this agent
+ * @returns {string} the block, or '' when no indexed search tool is available
+ */
+function searchGuidanceBlock(toolNames) {
+  const names = Array.isArray(toolNames) ? toolNames : [];
+  const available = SEARCH_GUIDANCE_TOOLS.filter((t) => names.includes(t));
+  if (!available.length) return '';
+  return [
+    `<${SEARCH_GUIDANCE_TAG}>`,
+    'Search with the indexed tools before reaching for the shell — they skip build',
+    `output and are both faster and cheaper: ${available.join(', ')}.`,
+    'For symbol and call-path questions prefer codegraph_explore over reading files.',
+    '',
+    'If you do run a recursive `grep`/`rg`, bound it. Always add',
+    '`--exclude-dir=target --exclude-dir=node_modules --exclude-dir=.git` and scope',
+    'with `--include=*.rs` / `--include=*.tsx`. A bare `grep -rn <pattern> src-tauri`',
+    'walks tens of gigabytes of build artifacts in this project and can hang for',
+    'minutes without producing a single usable line.',
+    `</${SEARCH_GUIDANCE_TAG}>`,
+  ].join('\n');
+}
+
+/**
+ * Append the indexed-search guidance to an agent body, idempotently.
+ * @param {string} text
+ * @param {string[]} toolNames
+ * @returns {{ text: string, injected: boolean }}
+ */
+function injectSearchGuidance(text, toolNames) {
+  if (!text) return { text, injected: false };
+  // Self-retiring: the source never carries our tag, so the anchor check is what
+  // matters — it detects an upstream body that already names the indexed tools.
+  if (text.includes(SEARCH_GUIDANCE_TAG) || text.includes(SEARCH_GUIDANCE_ANCHOR)) {
+    return { text, injected: false };
+  }
+  const block = searchGuidanceBlock(toolNames);
+  if (!block) return { text, injected: false };
+  return { text: `${text.trimEnd()}\n\n${block}\n`, injected: true };
+}
+
+
 /**
  * Render the generated agent's frontmatter.
  * @returns {string} YAML frontmatter block, including the trailing newline
@@ -1536,6 +1600,9 @@ function convertAgent(raw, name, ctx) {
   bodyOut = colon.text;
   if (colon.count) notes.push(`normalized ${colon.count} /gsd:<cmd> reference(s) to /gsd-<cmd>`);
 
+  const search = injectSearchGuidance(bodyOut, tools);
+  bodyOut = search.text;
+  if (search.injected) notes.push('injected indexed-search guidance (bound recursive greps, prefer ffgrep/codegraph)');
   if (caps.dropped.length) notes.push(`dropped tool(s) with no pi equivalent: ${caps.dropped.join(', ')}`);
   if (caps.unknown.length) notes.push(`unknown tool(s) kept out of the allowlist: ${caps.unknown.join(', ')}`);
   if (data.effort && !thinking) notes.push(`effort "${data.effort}" is not a pi thinking level — dropped`);
@@ -2679,6 +2746,11 @@ module.exports._internals = {
   inlineContext,
   convertCommand,
   convertAgent,
+  searchGuidanceBlock,
+  injectSearchGuidance,
+  SEARCH_GUIDANCE_TAG,
+  SEARCH_GUIDANCE_ANCHOR,
+  SEARCH_GUIDANCE_TOOLS,
   agentRuntimeContract,
   subagentDispatchBlock,
   discoverSource,
